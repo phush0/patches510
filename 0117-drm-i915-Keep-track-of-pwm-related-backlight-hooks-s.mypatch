@@ -386,7 +386,7 @@ index 67f81ae995c4..8c99bf404a32 100644
  }
  
  static int lpt_setup_backlight(struct intel_connector *connector, enum pipe unused)
-@@ -1628,37 +1633,32 @@ static int lpt_setup_backlight(struct intel_connector *connector, enum pipe unus
+@@ -1628,42 +1633,37 @@ static int lpt_setup_backlight(struct intel_connector *connector, enum pipe unus
  	panel->backlight.active_low_pwm = pch_ctl1 & BLM_PCH_POLARITY;
  
  	pch_ctl2 = intel_de_read(dev_priv, BLC_PWM_PCH_CTL2);
@@ -418,9 +418,6 @@ index 67f81ae995c4..8c99bf404a32 100644
 -		val = pch_get_backlight(connector);
 -	else
 -		val = lpt_get_backlight(connector);
--	val = intel_panel_compute_brightness(connector, val);
--	panel->backlight.level = clamp(val, panel->backlight.min,
--				       panel->backlight.max);
  
  	if (cpu_mode) {
 +		val = intel_panel_sanitize_pwm_level(connector, pch_get_backlight(connector));
@@ -429,11 +426,19 @@ index 67f81ae995c4..8c99bf404a32 100644
  			    "CPU backlight register was enabled, switching to PCH override\n");
  
  		/* Write converted CPU PWM value to PCH override register */
--		lpt_set_backlight(connector->base.state, panel->backlight.level);
+-		lpt_set_backlight(connector->base.state, val);
 +		lpt_set_backlight(connector->base.state, val);
  		intel_de_write(dev_priv, BLC_PWM_PCH_CTL1,
  			       pch_ctl1 | BLM_PCH_OVERRIDE_ENABLE);
  
+		intel_de_write(dev_priv, BLC_PWM_CPU_CTL2,
+			       cpu_ctl2 & ~BLM_PWM_ENABLE);
+	}
+
+-	val = intel_panel_compute_brightness(connector, val);
+-	panel->backlight.level = clamp(val, panel->backlight.min,
+-				       panel->backlight.max);
+
 @@ -1673,29 +1673,24 @@ static int pch_setup_backlight(struct intel_connector *connector, enum pipe unus
  {
  	struct drm_i915_private *dev_priv = to_i915(connector->base.dev);
