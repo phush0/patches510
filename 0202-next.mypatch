@@ -1,0 +1,1739 @@
+From 4622dbeec06c856437745024f41cbc0a43a1226c Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@techsingularity.net>
+Date: Fri, 20 Nov 2020 09:06:28 +0000
+Subject: [PATCH 01/17] sched: Avoid unnecessary calculation of load imbalance
+ at clone time
+
+In find_idlest_group(), the load imbalance is only relevant when the group
+is either overloaded or fully busy but it is calculated unconditionally.
+This patch moves the imbalance calculation to the context it is required.
+Technically, it is a micro-optimisation but really the benefit is avoiding
+confusing one type of imbalance with another depending on the group_type
+in the next patch.
+
+No functional change.
+
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20201120090630.3286-3-mgorman@techsingularity.net
+---
+ kernel/sched/fair.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index ae7ceba8fd4f2..ff597ef2cde46 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -8775,9 +8775,6 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 			.group_type = group_overloaded,
+ 	};
+ 
+-	imbalance = scale_load_down(NICE_0_LOAD) *
+-				(sd->imbalance_pct-100) / 100;
+-
+ 	do {
+ 		int local_group;
+ 
+@@ -8831,6 +8828,11 @@ find_idlest_group(struct sched_domain *sd, struct task_struct *p, int this_cpu)
+ 	switch (local_sgs.group_type) {
+ 	case group_overloaded:
+ 	case group_fully_busy:
++
++		/* Calculate allowed imbalance based on load */
++		imbalance = scale_load_down(NICE_0_LOAD) *
++				(sd->imbalance_pct-100) / 100;
++
+ 		/*
+ 		 * When comparing groups across NUMA domains, it's possible for
+ 		 * the local domain to be very lightly loaded relative to the
+
+From 0cc1bec01c41c8de4645e52e8dae5bbf099c9607 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 15 Jun 2020 11:51:29 +0200
+Subject: [PATCH 02/17] irq_work: Cleanup
+
+Get rid of the __call_single_node union and clean up the API a little
+to avoid external code relying on the structure layout as much.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+---
+ drivers/gpu/drm/i915/i915_request.c |  4 ++--
+ include/linux/irq_work.h            | 33 ++++++++++++++++++-----------
+ include/linux/irqflags.h            |  4 ++--
+ kernel/bpf/stackmap.c               |  2 +-
+ kernel/irq_work.c                   | 18 ++++++++--------
+ kernel/printk/printk.c              |  6 ++----
+ kernel/rcu/tree.c                   |  3 +--
+ kernel/time/tick-sched.c            |  6 ++----
+ kernel/trace/bpf_trace.c            |  2 +-
+ 9 files changed, 41 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_request.c b/drivers/gpu/drm/i915/i915_request.c
+index 0e813819b041b..5385b081a3763 100644
+--- a/drivers/gpu/drm/i915/i915_request.c
++++ b/drivers/gpu/drm/i915/i915_request.c
+@@ -197,7 +197,7 @@ __notify_execute_cb(struct i915_request *rq, bool (*fn)(struct irq_work *wrk))
+ 
+ 	llist_for_each_entry_safe(cb, cn,
+ 				  llist_del_all(&rq->execute_cb),
+-				  work.llnode)
++				  work.node.llist)
+ 		fn(&cb->work);
+ }
+ 
+@@ -460,7 +460,7 @@ __await_execution(struct i915_request *rq,
+ 	 * callback first, then checking the ACTIVE bit, we serialise with
+ 	 * the completed/retired request.
+ 	 */
+-	if (llist_add(&cb->work.llnode, &signal->execute_cb)) {
++	if (llist_add(&cb->work.node.llist, &signal->execute_cb)) {
+ 		if (i915_request_is_active(signal) ||
+ 		    __request_in_flight(signal))
+ 			__notify_execute_cb_imm(signal);
+diff --git a/include/linux/irq_work.h b/include/linux/irq_work.h
+index 30823780c1928..ec2a47a81e423 100644
+--- a/include/linux/irq_work.h
++++ b/include/linux/irq_work.h
+@@ -14,28 +14,37 @@
+  */
+ 
+ struct irq_work {
+-	union {
+-		struct __call_single_node node;
+-		struct {
+-			struct llist_node llnode;
+-			atomic_t flags;
+-		};
+-	};
++	struct __call_single_node node;
+ 	void (*func)(struct irq_work *);
+ };
+ 
++#define __IRQ_WORK_INIT(_func, _flags) (struct irq_work){	\
++	.node = { .u_flags = (_flags), },			\
++	.func = (_func),					\
++}
++
++#define IRQ_WORK_INIT(_func) __IRQ_WORK_INIT(_func, 0)
++#define IRQ_WORK_INIT_LAZY(_func) __IRQ_WORK_INIT(_func, IRQ_WORK_LAZY)
++#define IRQ_WORK_INIT_HARD(_func) __IRQ_WORK_INIT(_func, IRQ_WORK_HARD_IRQ)
++
++#define DEFINE_IRQ_WORK(name, _f)				\
++	struct irq_work name = IRQ_WORK_INIT(_f)
++
+ static inline
+ void init_irq_work(struct irq_work *work, void (*func)(struct irq_work *))
+ {
+-	atomic_set(&work->flags, 0);
+-	work->func = func;
++	*work = IRQ_WORK_INIT(func);
+ }
+ 
+-#define DEFINE_IRQ_WORK(name, _f) struct irq_work name = {	\
+-		.flags = ATOMIC_INIT(0),			\
+-		.func  = (_f)					\
++static inline bool irq_work_is_pending(struct irq_work *work)
++{
++	return atomic_read(&work->node.a_flags) & IRQ_WORK_PENDING;
+ }
+ 
++static inline bool irq_work_is_busy(struct irq_work *work)
++{
++	return atomic_read(&work->node.a_flags) & IRQ_WORK_BUSY;
++}
+ 
+ bool irq_work_queue(struct irq_work *work);
+ bool irq_work_queue_on(struct irq_work *work, int cpu);
+diff --git a/include/linux/irqflags.h b/include/linux/irqflags.h
+index 3ed4e8771b64e..fef2d43a7a1d8 100644
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@ -109,12 +109,12 @@ do {						\
+ 
+ # define lockdep_irq_work_enter(__work)					\
+ 	  do {								\
+-		  if (!(atomic_read(&__work->flags) & IRQ_WORK_HARD_IRQ))\
++		  if (!(atomic_read(&__work->node.a_flags) & IRQ_WORK_HARD_IRQ))\
+ 			current->irq_config = 1;			\
+ 	  } while (0)
+ # define lockdep_irq_work_exit(__work)					\
+ 	  do {								\
+-		  if (!(atomic_read(&__work->flags) & IRQ_WORK_HARD_IRQ))\
++		  if (!(atomic_read(&__work->node.a_flags) & IRQ_WORK_HARD_IRQ))\
+ 			current->irq_config = 0;			\
+ 	  } while (0)
+ 
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index 06065fa271241..599041cd0c8a7 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -298,7 +298,7 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
+ 	if (irqs_disabled()) {
+ 		if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
+ 			work = this_cpu_ptr(&up_read_work);
+-			if (atomic_read(&work->irq_work.flags) & IRQ_WORK_BUSY) {
++			if (irq_work_is_busy(&work->irq_work)) {
+ 				/* cannot queue more up_read, fallback */
+ 				irq_work_busy = true;
+ 			}
+diff --git a/kernel/irq_work.c b/kernel/irq_work.c
+index eca83965b631a..fbff25adb5742 100644
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@ -31,7 +31,7 @@ static bool irq_work_claim(struct irq_work *work)
+ {
+ 	int oflags;
+ 
+-	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED | CSD_TYPE_IRQ_WORK, &work->flags);
++	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED | CSD_TYPE_IRQ_WORK, &work->node.a_flags);
+ 	/*
+ 	 * If the work is already pending, no need to raise the IPI.
+ 	 * The pairing atomic_fetch_andnot() in irq_work_run() makes sure
+@@ -53,12 +53,12 @@ void __weak arch_irq_work_raise(void)
+ static void __irq_work_queue_local(struct irq_work *work)
+ {
+ 	/* If the work is "lazy", handle it from next tick if any */
+-	if (atomic_read(&work->flags) & IRQ_WORK_LAZY) {
+-		if (llist_add(&work->llnode, this_cpu_ptr(&lazy_list)) &&
++	if (atomic_read(&work->node.a_flags) & IRQ_WORK_LAZY) {
++		if (llist_add(&work->node.llist, this_cpu_ptr(&lazy_list)) &&
+ 		    tick_nohz_tick_stopped())
+ 			arch_irq_work_raise();
+ 	} else {
+-		if (llist_add(&work->llnode, this_cpu_ptr(&raised_list)))
++		if (llist_add(&work->node.llist, this_cpu_ptr(&raised_list)))
+ 			arch_irq_work_raise();
+ 	}
+ }
+@@ -102,7 +102,7 @@ bool irq_work_queue_on(struct irq_work *work, int cpu)
+ 	if (cpu != smp_processor_id()) {
+ 		/* Arch remote IPI send/receive backend aren't NMI safe */
+ 		WARN_ON_ONCE(in_nmi());
+-		__smp_call_single_queue(cpu, &work->llnode);
++		__smp_call_single_queue(cpu, &work->node.llist);
+ 	} else {
+ 		__irq_work_queue_local(work);
+ 	}
+@@ -142,7 +142,7 @@ void irq_work_single(void *arg)
+ 	 * to claim that work don't rely on us to handle their data
+ 	 * while we are in the middle of the func.
+ 	 */
+-	flags = atomic_fetch_andnot(IRQ_WORK_PENDING, &work->flags);
++	flags = atomic_fetch_andnot(IRQ_WORK_PENDING, &work->node.a_flags);
+ 
+ 	lockdep_irq_work_enter(work);
+ 	work->func(work);
+@@ -152,7 +152,7 @@ void irq_work_single(void *arg)
+ 	 * no-one else claimed it meanwhile.
+ 	 */
+ 	flags &= ~IRQ_WORK_PENDING;
+-	(void)atomic_cmpxchg(&work->flags, flags, flags & ~IRQ_WORK_BUSY);
++	(void)atomic_cmpxchg(&work->node.a_flags, flags, flags & ~IRQ_WORK_BUSY);
+ }
+ 
+ static void irq_work_run_list(struct llist_head *list)
+@@ -166,7 +166,7 @@ static void irq_work_run_list(struct llist_head *list)
+ 		return;
+ 
+ 	llnode = llist_del_all(list);
+-	llist_for_each_entry_safe(work, tmp, llnode, llnode)
++	llist_for_each_entry_safe(work, tmp, llnode, node.llist)
+ 		irq_work_single(work);
+ }
+ 
+@@ -198,7 +198,7 @@ void irq_work_sync(struct irq_work *work)
+ {
+ 	lockdep_assert_irqs_enabled();
+ 
+-	while (atomic_read(&work->flags) & IRQ_WORK_BUSY)
++	while (irq_work_is_busy(work))
+ 		cpu_relax();
+ }
+ EXPORT_SYMBOL_GPL(irq_work_sync);
+diff --git a/kernel/printk/printk.c b/kernel/printk/printk.c
+index bc1e3b5a97bdd..28713dda3f6b2 100644
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -3025,10 +3025,8 @@ static void wake_up_klogd_work_func(struct irq_work *irq_work)
+ 		wake_up_interruptible(&log_wait);
+ }
+ 
+-static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) = {
+-	.func = wake_up_klogd_work_func,
+-	.flags = ATOMIC_INIT(IRQ_WORK_LAZY),
+-};
++static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) =
++	IRQ_WORK_INIT_LAZY(wake_up_klogd_work_func);
+ 
+ void wake_up_klogd(void)
+ {
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index bd04b09b84b32..ed4941f0bd597 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -1311,8 +1311,6 @@ static int rcu_implicit_dynticks_qs(struct rcu_data *rdp)
+ 		if (IS_ENABLED(CONFIG_IRQ_WORK) &&
+ 		    !rdp->rcu_iw_pending && rdp->rcu_iw_gp_seq != rnp->gp_seq &&
+ 		    (rnp->ffmask & rdp->grpmask)) {
+-			init_irq_work(&rdp->rcu_iw, rcu_iw_handler);
+-			atomic_set(&rdp->rcu_iw.flags, IRQ_WORK_HARD_IRQ);
+ 			rdp->rcu_iw_pending = true;
+ 			rdp->rcu_iw_gp_seq = rnp->gp_seq;
+ 			irq_work_queue_on(&rdp->rcu_iw, rdp->cpu);
+@@ -3964,6 +3962,7 @@ int rcutree_prepare_cpu(unsigned int cpu)
+ 	rdp->cpu_no_qs.b.norm = true;
+ 	rdp->core_needs_qs = false;
+ 	rdp->rcu_iw_pending = false;
++	rdp->rcu_iw = IRQ_WORK_INIT_HARD(rcu_iw_handler);
+ 	rdp->rcu_iw_gp_seq = rdp->gp_seq - 1;
+ 	trace_rcu_grace_period(rcu_state.name, rdp->gp_seq, TPS("cpuonl"));
+ 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+diff --git a/kernel/time/tick-sched.c b/kernel/time/tick-sched.c
+index 81632cd5e3b72..1b734070f0286 100644
+--- a/kernel/time/tick-sched.c
++++ b/kernel/time/tick-sched.c
+@@ -243,10 +243,8 @@ static void nohz_full_kick_func(struct irq_work *work)
+ 	/* Empty, the tick restart happens on tick_nohz_irq_exit() */
+ }
+ 
+-static DEFINE_PER_CPU(struct irq_work, nohz_full_kick_work) = {
+-	.func = nohz_full_kick_func,
+-	.flags = ATOMIC_INIT(IRQ_WORK_HARD_IRQ),
+-};
++static DEFINE_PER_CPU(struct irq_work, nohz_full_kick_work) =
++	IRQ_WORK_INIT_HARD(nohz_full_kick_func);
+ 
+ /*
+  * Kick this CPU if it's full dynticks in order to force it to
+diff --git a/kernel/trace/bpf_trace.c b/kernel/trace/bpf_trace.c
+index a125ea5e04cd7..852226dd4b11b 100644
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@ -1096,7 +1096,7 @@ static int bpf_send_signal_common(u32 sig, enum pid_type type)
+ 			return -EINVAL;
+ 
+ 		work = this_cpu_ptr(&send_signal_work);
+-		if (atomic_read(&work->irq_work.flags) & IRQ_WORK_BUSY)
++		if (irq_work_is_busy(&work->irq_work))
+ 			return -EBUSY;
+ 
+ 		/* Add the current task, which is the target of sending signal,
+
+From e9e4333f1a1a36c6975bdc26cc09f7d2886fee04 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 18 Jun 2020 22:28:37 +0200
+Subject: [PATCH 03/17] irq_work: Optimize irq_work_single()
+
+Trade one atomic op for a full memory barrier.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+---
+ include/linux/irqflags.h |  8 ++++----
+ kernel/irq_work.c        | 29 +++++++++++++++++------------
+ 2 files changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/irqflags.h b/include/linux/irqflags.h
+index fef2d43a7a1d8..8de0e1373de70 100644
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@ -107,14 +107,14 @@ do {						\
+ 		  current->irq_config = 0;			\
+ 	  } while (0)
+ 
+-# define lockdep_irq_work_enter(__work)					\
++# define lockdep_irq_work_enter(_flags)					\
+ 	  do {								\
+-		  if (!(atomic_read(&__work->node.a_flags) & IRQ_WORK_HARD_IRQ))\
++		  if (!((_flags) & IRQ_WORK_HARD_IRQ))			\
+ 			current->irq_config = 1;			\
+ 	  } while (0)
+-# define lockdep_irq_work_exit(__work)					\
++# define lockdep_irq_work_exit(_flags)					\
+ 	  do {								\
+-		  if (!(atomic_read(&__work->node.a_flags) & IRQ_WORK_HARD_IRQ))\
++		  if (!((_flags) & IRQ_WORK_HARD_IRQ))			\
+ 			current->irq_config = 0;			\
+ 	  } while (0)
+ 
+diff --git a/kernel/irq_work.c b/kernel/irq_work.c
+index fbff25adb5742..e8da1e71583a1 100644
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@ -34,7 +34,7 @@ static bool irq_work_claim(struct irq_work *work)
+ 	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED | CSD_TYPE_IRQ_WORK, &work->node.a_flags);
+ 	/*
+ 	 * If the work is already pending, no need to raise the IPI.
+-	 * The pairing atomic_fetch_andnot() in irq_work_run() makes sure
++	 * The pairing smp_mb() in irq_work_single() makes sure
+ 	 * everything we did before is visible.
+ 	 */
+ 	if (oflags & IRQ_WORK_PENDING)
+@@ -136,22 +136,27 @@ void irq_work_single(void *arg)
+ 	int flags;
+ 
+ 	/*
+-	 * Clear the PENDING bit, after this point the @work
+-	 * can be re-used.
+-	 * Make it immediately visible so that other CPUs trying
+-	 * to claim that work don't rely on us to handle their data
+-	 * while we are in the middle of the func.
++	 * Clear the PENDING bit, after this point the @work can be re-used.
++	 * The PENDING bit acts as a lock, and we own it, so we can clear it
++	 * without atomic ops.
+ 	 */
+-	flags = atomic_fetch_andnot(IRQ_WORK_PENDING, &work->node.a_flags);
++	flags = atomic_read(&work->node.a_flags);
++	flags &= ~IRQ_WORK_PENDING;
++	atomic_set(&work->node.a_flags, flags);
++
++	/*
++	 * See irq_work_claim().
++	 */
++	smp_mb();
+ 
+-	lockdep_irq_work_enter(work);
++	lockdep_irq_work_enter(flags);
+ 	work->func(work);
+-	lockdep_irq_work_exit(work);
++	lockdep_irq_work_exit(flags);
++
+ 	/*
+-	 * Clear the BUSY bit and return to the free state if
+-	 * no-one else claimed it meanwhile.
++	 * Clear the BUSY bit, if set, and return to the free state if no-one
++	 * else claimed it meanwhile.
+ 	 */
+-	flags &= ~IRQ_WORK_PENDING;
+ 	(void)atomic_cmpxchg(&work->node.a_flags, flags, flags & ~IRQ_WORK_BUSY);
+ }
+ 
+
+From 9c4b7067bdc24fa4837d4e722e601186f23d15e1 Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Tue, 24 Nov 2020 17:58:12 +0000
+Subject: [PATCH 04/17] block: optimise for_each_bvec() advance
+
+Because of how for_each_bvec() works it never advances across multiple
+entries at a time, so bvec_iter_advance() is an overkill. Add
+specialised bvec_iter_advance_single() that is faster. It also handles
+zero-len bvecs, so can kill bvec_iter_skip_zero_bvec().
+
+   text    data     bss     dec     hex filename
+before:
+  23977     805       0   24782    60ce lib/iov_iter.o
+before, bvec_iter_advance() w/o WARN_ONCE()
+  22886     600       0   23486    5bbe ./lib/iov_iter.o
+after:
+  21862     600       0   22462    57be lib/iov_iter.o
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ include/linux/bvec.h | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bvec.h b/include/linux/bvec.h
+index 2efec10bf7921..ff832e698efb2 100644
+--- a/include/linux/bvec.h
++++ b/include/linux/bvec.h
+@@ -121,18 +121,28 @@ static inline bool bvec_iter_advance(const struct bio_vec *bv,
+ 	return true;
+ }
+ 
+-static inline void bvec_iter_skip_zero_bvec(struct bvec_iter *iter)
++/*
++ * A simpler version of bvec_iter_advance(), @bytes should not span
++ * across multiple bvec entries, i.e. bytes <= bv[i->bi_idx].bv_len
++ */
++static inline void bvec_iter_advance_single(const struct bio_vec *bv,
++				struct bvec_iter *iter, unsigned int bytes)
+ {
+-	iter->bi_bvec_done = 0;
+-	iter->bi_idx++;
++	unsigned int done = iter->bi_bvec_done + bytes;
++
++	if (done == bv[iter->bi_idx].bv_len) {
++		done = 0;
++		iter->bi_idx++;
++	}
++	iter->bi_bvec_done = done;
++	iter->bi_size -= bytes;
+ }
+ 
+ #define for_each_bvec(bvl, bio_vec, iter, start)			\
+ 	for (iter = (start);						\
+ 	     (iter).bi_size &&						\
+ 		((bvl = bvec_iter_bvec((bio_vec), (iter))), 1);	\
+-	     (bvl).bv_len ? (void)bvec_iter_advance((bio_vec), &(iter),	\
+-		     (bvl).bv_len) : bvec_iter_skip_zero_bvec(&(iter)))
++	     bvec_iter_advance_single((bio_vec), &(iter), (bvl).bv_len))
+ 
+ /* for iterating one bio from start to end */
+ #define BVEC_ITER_ALL_INIT (struct bvec_iter)				\
+
+From 11c8d173250bbe5d060035d7f5559ecccd28380b Mon Sep 17 00:00:00 2001
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Tue, 24 Nov 2020 17:58:13 +0000
+Subject: [PATCH 05/17] bio: optimise bvec iteration
+
+__bio_for_each_bvec(), __bio_for_each_segment() and bio_copy_data_iter()
+fall under conditions of bvec_iter_advance_single(), which is a faster
+and slimmer version of bvec_iter_advance(). Add
+bio_advance_iter_single() and convert them.
+
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/bio.c         |  4 ++--
+ include/linux/bio.h | 17 +++++++++++++++--
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index fa01bef35bb1f..8e718920457a3 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1212,8 +1212,8 @@ void bio_copy_data_iter(struct bio *dst, struct bvec_iter *dst_iter,
+ 
+ 		flush_dcache_page(dst_bv.bv_page);
+ 
+-		bio_advance_iter(src, src_iter, bytes);
+-		bio_advance_iter(dst, dst_iter, bytes);
++		bio_advance_iter_single(src, src_iter, bytes);
++		bio_advance_iter_single(dst, dst_iter, bytes);
+ 	}
+ }
+ EXPORT_SYMBOL(bio_copy_data_iter);
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index c6d7653829264..d55d53c49ae41 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -148,11 +148,24 @@ static inline void bio_advance_iter(const struct bio *bio,
+ 		/* TODO: It is reasonable to complete bio with error here. */
+ }
+ 
++/* @bytes should be less or equal to bvec[i->bi_idx].bv_len */
++static inline void bio_advance_iter_single(const struct bio *bio,
++					   struct bvec_iter *iter,
++					   unsigned int bytes)
++{
++	iter->bi_sector += bytes >> 9;
++
++	if (bio_no_advance_iter(bio))
++		iter->bi_size -= bytes;
++	else
++		bvec_iter_advance_single(bio->bi_io_vec, iter, bytes);
++}
++
+ #define __bio_for_each_segment(bvl, bio, iter, start)			\
+ 	for (iter = (start);						\
+ 	     (iter).bi_size &&						\
+ 		((bvl = bio_iter_iovec((bio), (iter))), 1);		\
+-	     bio_advance_iter((bio), &(iter), (bvl).bv_len))
++	     bio_advance_iter_single((bio), &(iter), (bvl).bv_len))
+ 
+ #define bio_for_each_segment(bvl, bio, iter)				\
+ 	__bio_for_each_segment(bvl, bio, iter, (bio)->bi_iter)
+@@ -161,7 +174,7 @@ static inline void bio_advance_iter(const struct bio *bio,
+ 	for (iter = (start);						\
+ 	     (iter).bi_size &&						\
+ 		((bvl = mp_bvec_iter_bvec((bio)->bi_io_vec, (iter))), 1); \
+-	     bio_advance_iter((bio), &(iter), (bvl).bv_len))
++	     bio_advance_iter_single((bio), &(iter), (bvl).bv_len))
+ 
+ /* iterate over multi-page bvec */
+ #define bio_for_each_bvec(bvl, bio, iter)			\
+
+From f495fbd6e9595ffefd71c665adaf4099ac5e8b74 Mon Sep 17 00:00:00 2001
+From: Kalesh Singh <kaleshsingh@google.com>
+Date: Mon, 14 Dec 2020 19:07:30 -0800
+Subject: [PATCH 06/17] mm: speedup mremap on 1GB or larger regions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Android needs to move large memory regions for garbage collection.  The GC
+requires moving physical pages of multi-gigabyte heap using mremap.
+During this move, the application threads have to be paused for
+correctness.  It is critical to keep this pause as short as possible to
+avoid jitters during user interaction.
+
+Optimize mremap for >= 1GB-sized regions by moving at the PUD/PGD level if
+the source and destination addresses are PUD-aligned.  For
+CONFIG_PGTABLE_LEVELS == 3, moving at the PUD level in effect moves PGD
+entries, since the PUD entry is “folded back” onto the PGD entry.  Add
+HAVE_MOVE_PUD so that architectures where moving at the PUD level isn't
+supported/tested can turn this off by not selecting the config.
+
+Link: https://lkml.kernel.org/r/20201014005320.2233162-4-kaleshsingh@google.com
+Signed-off-by: Kalesh Singh <kaleshsingh@google.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: kernel test robot <lkp@intel.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christian Brauner <christian.brauner@ubuntu.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Gavin Shan <gshan@redhat.com>
+Cc: Hassan Naveed <hnaveed@wavecomp.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jia He <justin.he@arm.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Krzysztof Kozlowski <krzk@kernel.org>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Minchan Kim <minchan@google.com>
+Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Ram Pai <linuxram@us.ibm.com>
+Cc: Sami Tolvanen <samitolvanen@google.com>
+Cc: Sandipan Das <sandipan@linux.ibm.com>
+Cc: SeongJae Park <sjpark@amazon.de>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Deacon <will@kernel.org>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ arch/Kconfig |   7 ++
+ mm/mremap.c  | 230 ++++++++++++++++++++++++++++++++++++++++++---------
+ 2 files changed, 197 insertions(+), 40 deletions(-)
+
+diff --git a/arch/Kconfig b/arch/Kconfig
+index ba4e966484ab5..ccd6269d77e66 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -648,6 +648,13 @@ config HAVE_IRQ_TIME_ACCOUNTING
+ 	  Archs need to ensure they use a high enough resolution clock to
+ 	  support irq time accounting and then call enable_sched_clock_irqtime().
+ 
++config HAVE_MOVE_PUD
++	bool
++	help
++	  Architectures that select this are able to move page tables at the
++	  PUD level. If there are only 3 page table levels, the move effectively
++	  happens at the PGD level.
++
+ config HAVE_MOVE_PMD
+ 	bool
+ 	help
+diff --git a/mm/mremap.c b/mm/mremap.c
+index 138abbae4f758..078f731277b6e 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -30,12 +30,11 @@
+ 
+ #include "internal.h"
+ 
+-static pmd_t *get_old_pmd(struct mm_struct *mm, unsigned long addr)
++static pud_t *get_old_pud(struct mm_struct *mm, unsigned long addr)
+ {
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+ 	pud_t *pud;
+-	pmd_t *pmd;
+ 
+ 	pgd = pgd_offset(mm, addr);
+ 	if (pgd_none_or_clear_bad(pgd))
+@@ -49,6 +48,18 @@ static pmd_t *get_old_pmd(struct mm_struct *mm, unsigned long addr)
+ 	if (pud_none_or_clear_bad(pud))
+ 		return NULL;
+ 
++	return pud;
++}
++
++static pmd_t *get_old_pmd(struct mm_struct *mm, unsigned long addr)
++{
++	pud_t *pud;
++	pmd_t *pmd;
++
++	pud = get_old_pud(mm, addr);
++	if (!pud)
++		return NULL;
++
+ 	pmd = pmd_offset(pud, addr);
+ 	if (pmd_none(*pmd))
+ 		return NULL;
+@@ -56,19 +67,27 @@ static pmd_t *get_old_pmd(struct mm_struct *mm, unsigned long addr)
+ 	return pmd;
+ }
+ 
+-static pmd_t *alloc_new_pmd(struct mm_struct *mm, struct vm_area_struct *vma,
++static pud_t *alloc_new_pud(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			    unsigned long addr)
+ {
+ 	pgd_t *pgd;
+ 	p4d_t *p4d;
+-	pud_t *pud;
+-	pmd_t *pmd;
+ 
+ 	pgd = pgd_offset(mm, addr);
+ 	p4d = p4d_alloc(mm, pgd, addr);
+ 	if (!p4d)
+ 		return NULL;
+-	pud = pud_alloc(mm, p4d, addr);
++
++	return pud_alloc(mm, p4d, addr);
++}
++
++static pmd_t *alloc_new_pmd(struct mm_struct *mm, struct vm_area_struct *vma,
++			    unsigned long addr)
++{
++	pud_t *pud;
++	pmd_t *pmd;
++
++	pud = alloc_new_pud(mm, vma, addr);
+ 	if (!pud)
+ 		return NULL;
+ 
+@@ -249,14 +268,148 @@ static bool move_normal_pmd(struct vm_area_struct *vma, unsigned long old_addr,
+ 
+ 	return true;
+ }
++#else
++static inline bool move_normal_pmd(struct vm_area_struct *vma,
++		unsigned long old_addr, unsigned long new_addr, pmd_t *old_pmd,
++		pmd_t *new_pmd)
++{
++	return false;
++}
+ #endif
+ 
++#ifdef CONFIG_HAVE_MOVE_PUD
++static bool move_normal_pud(struct vm_area_struct *vma, unsigned long old_addr,
++		  unsigned long new_addr, pud_t *old_pud, pud_t *new_pud)
++{
++	spinlock_t *old_ptl, *new_ptl;
++	struct mm_struct *mm = vma->vm_mm;
++	pud_t pud;
++
++	/*
++	 * The destination pud shouldn't be established, free_pgtables()
++	 * should have released it.
++	 */
++	if (WARN_ON_ONCE(!pud_none(*new_pud)))
++		return false;
++
++	/*
++	 * We don't have to worry about the ordering of src and dst
++	 * ptlocks because exclusive mmap_lock prevents deadlock.
++	 */
++	old_ptl = pud_lock(vma->vm_mm, old_pud);
++	new_ptl = pud_lockptr(mm, new_pud);
++	if (new_ptl != old_ptl)
++		spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
++
++	/* Clear the pud */
++	pud = *old_pud;
++	pud_clear(old_pud);
++
++	VM_BUG_ON(!pud_none(*new_pud));
++
++	/* Set the new pud */
++	set_pud_at(mm, new_addr, new_pud, pud);
++	flush_tlb_range(vma, old_addr, old_addr + PUD_SIZE);
++	if (new_ptl != old_ptl)
++		spin_unlock(new_ptl);
++	spin_unlock(old_ptl);
++
++	return true;
++}
++#else
++static inline bool move_normal_pud(struct vm_area_struct *vma,
++		unsigned long old_addr, unsigned long new_addr, pud_t *old_pud,
++		pud_t *new_pud)
++{
++	return false;
++}
++#endif
++
++enum pgt_entry {
++	NORMAL_PMD,
++	HPAGE_PMD,
++	NORMAL_PUD,
++};
++
++/*
++ * Returns an extent of the corresponding size for the pgt_entry specified if
++ * valid. Else returns a smaller extent bounded by the end of the source and
++ * destination pgt_entry.
++ */
++static unsigned long get_extent(enum pgt_entry entry, unsigned long old_addr,
++			unsigned long old_end, unsigned long new_addr)
++{
++	unsigned long next, extent, mask, size;
++
++	switch (entry) {
++	case HPAGE_PMD:
++	case NORMAL_PMD:
++		mask = PMD_MASK;
++		size = PMD_SIZE;
++		break;
++	case NORMAL_PUD:
++		mask = PUD_MASK;
++		size = PUD_SIZE;
++		break;
++	default:
++		BUILD_BUG();
++		break;
++	}
++
++	next = (old_addr + size) & mask;
++	/* even if next overflowed, extent below will be ok */
++	extent = (next > old_end) ? old_end - old_addr : next - old_addr;
++	next = (new_addr + size) & mask;
++	if (extent > next - new_addr)
++		extent = next - new_addr;
++	return extent;
++}
++
++/*
++ * Attempts to speedup the move by moving entry at the level corresponding to
++ * pgt_entry. Returns true if the move was successful, else false.
++ */
++static bool move_pgt_entry(enum pgt_entry entry, struct vm_area_struct *vma,
++			unsigned long old_addr, unsigned long new_addr,
++			void *old_entry, void *new_entry, bool need_rmap_locks)
++{
++	bool moved = false;
++
++	/* See comment in move_ptes() */
++	if (need_rmap_locks)
++		take_rmap_locks(vma);
++
++	switch (entry) {
++	case NORMAL_PMD:
++		moved = move_normal_pmd(vma, old_addr, new_addr, old_entry,
++					new_entry);
++		break;
++	case NORMAL_PUD:
++		moved = move_normal_pud(vma, old_addr, new_addr, old_entry,
++					new_entry);
++		break;
++	case HPAGE_PMD:
++		moved = IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
++			move_huge_pmd(vma, old_addr, new_addr, old_entry,
++				      new_entry);
++		break;
++	default:
++		WARN_ON_ONCE(1);
++		break;
++	}
++
++	if (need_rmap_locks)
++		drop_rmap_locks(vma);
++
++	return moved;
++}
++
+ unsigned long move_page_tables(struct vm_area_struct *vma,
+ 		unsigned long old_addr, struct vm_area_struct *new_vma,
+ 		unsigned long new_addr, unsigned long len,
+ 		bool need_rmap_locks)
+ {
+-	unsigned long extent, next, old_end;
++	unsigned long extent, old_end;
+ 	struct mmu_notifier_range range;
+ 	pmd_t *old_pmd, *new_pmd;
+ 
+@@ -269,53 +422,50 @@ unsigned long move_page_tables(struct vm_area_struct *vma,
+ 
+ 	for (; old_addr < old_end; old_addr += extent, new_addr += extent) {
+ 		cond_resched();
+-		next = (old_addr + PMD_SIZE) & PMD_MASK;
+-		/* even if next overflowed, extent below will be ok */
+-		extent = next - old_addr;
+-		if (extent > old_end - old_addr)
+-			extent = old_end - old_addr;
+-		next = (new_addr + PMD_SIZE) & PMD_MASK;
+-		if (extent > next - new_addr)
+-			extent = next - new_addr;
++		/*
++		 * If extent is PUD-sized try to speed up the move by moving at the
++		 * PUD level if possible.
++		 */
++		extent = get_extent(NORMAL_PUD, old_addr, old_end, new_addr);
++		if (IS_ENABLED(CONFIG_HAVE_MOVE_PUD) && extent == PUD_SIZE) {
++			pud_t *old_pud, *new_pud;
++
++			old_pud = get_old_pud(vma->vm_mm, old_addr);
++			if (!old_pud)
++				continue;
++			new_pud = alloc_new_pud(vma->vm_mm, vma, new_addr);
++			if (!new_pud)
++				break;
++			if (move_pgt_entry(NORMAL_PUD, vma, old_addr, new_addr,
++					   old_pud, new_pud, need_rmap_locks))
++				continue;
++		}
++
++		extent = get_extent(NORMAL_PMD, old_addr, old_end, new_addr);
+ 		old_pmd = get_old_pmd(vma->vm_mm, old_addr);
+ 		if (!old_pmd)
+ 			continue;
+ 		new_pmd = alloc_new_pmd(vma->vm_mm, vma, new_addr);
+ 		if (!new_pmd)
+ 			break;
+-		if (is_swap_pmd(*old_pmd) || pmd_trans_huge(*old_pmd) || pmd_devmap(*old_pmd)) {
+-			if (extent == HPAGE_PMD_SIZE) {
+-				bool moved;
+-				/* See comment in move_ptes() */
+-				if (need_rmap_locks)
+-					take_rmap_locks(vma);
+-				moved = move_huge_pmd(vma, old_addr, new_addr,
+-						      old_pmd, new_pmd);
+-				if (need_rmap_locks)
+-					drop_rmap_locks(vma);
+-				if (moved)
+-					continue;
+-			}
++		if (is_swap_pmd(*old_pmd) || pmd_trans_huge(*old_pmd) ||
++		    pmd_devmap(*old_pmd)) {
++			if (extent == HPAGE_PMD_SIZE &&
++			    move_pgt_entry(HPAGE_PMD, vma, old_addr, new_addr,
++					   old_pmd, new_pmd, need_rmap_locks))
++				continue;
+ 			split_huge_pmd(vma, old_pmd, old_addr);
+ 			if (pmd_trans_unstable(old_pmd))
+ 				continue;
+-		} else if (extent == PMD_SIZE) {
+-#ifdef CONFIG_HAVE_MOVE_PMD
++		} else if (IS_ENABLED(CONFIG_HAVE_MOVE_PMD) &&
++			   extent == PMD_SIZE) {
+ 			/*
+ 			 * If the extent is PMD-sized, try to speed the move by
+ 			 * moving at the PMD level if possible.
+ 			 */
+-			bool moved;
+-
+-			if (need_rmap_locks)
+-				take_rmap_locks(vma);
+-			moved = move_normal_pmd(vma, old_addr, new_addr,
+-						old_pmd, new_pmd);
+-			if (need_rmap_locks)
+-				drop_rmap_locks(vma);
+-			if (moved)
++			if (move_pgt_entry(NORMAL_PMD, vma, old_addr, new_addr,
++					   old_pmd, new_pmd, need_rmap_locks))
+ 				continue;
+-#endif
+ 		}
+ 
+ 		if (pte_alloc(new_vma->vm_mm, new_pmd))
+
+From a5f547785bb369346fd7dba9063b420528089928 Mon Sep 17 00:00:00 2001
+From: Kalesh Singh <kaleshsingh@google.com>
+Date: Mon, 14 Dec 2020 19:07:40 -0800
+Subject: [PATCH 07/17] x86: mremap speedup - Enable HAVE_MOVE_PUD
+
+HAVE_MOVE_PUD enables remapping pages at the PUD level if both the
+source and destination addresses are PUD-aligned.
+
+With HAVE_MOVE_PUD enabled it can be inferred that there is
+approximately a 13x improvement in performance on x86.  (See data
+below).
+
+------- Test Results ---------
+
+The following results were obtained using a 5.4 kernel, by remapping
+a PUD-aligned, 1GB sized region to a PUD-aligned destination.
+The results from 10 iterations of the test are given below:
+
+Total mremap times for 1GB data on x86. All times are in nanoseconds.
+
+  Control        HAVE_MOVE_PUD
+
+  180394         15089
+  235728         14056
+  238931         25741
+  187330         13838
+  241742         14187
+  177925         14778
+  182758         14728
+  160872         14418
+  205813         15107
+  245722         13998
+
+  205721.5       15594    <-- Mean time in nanoseconds
+
+A 1GB mremap completion time drops from ~205 microseconds
+to ~15 microseconds on x86. (~13x speed up).
+
+Link: https://lkml.kernel.org/r/20201014005320.2233162-6-kaleshsingh@google.com
+Signed-off-by: Kalesh Singh <kaleshsingh@google.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Ingo Molnar <mingo@redhat.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christian Brauner <christian.brauner@ubuntu.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Gavin Shan <gshan@redhat.com>
+Cc: Hassan Naveed <hnaveed@wavecomp.com>
+Cc: Jia He <justin.he@arm.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Krzysztof Kozlowski <krzk@kernel.org>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Minchan Kim <minchan@google.com>
+Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Ram Pai <linuxram@us.ibm.com>
+Cc: Sami Tolvanen <samitolvanen@google.com>
+Cc: Sandipan Das <sandipan@linux.ibm.com>
+Cc: SeongJae Park <sjpark@amazon.de>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ arch/x86/Kconfig | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index fbf26e0f7a6a9..46393177ce737 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -199,6 +199,7 @@ config X86
+ 	select HAVE_MIXED_BREAKPOINTS_REGS
+ 	select HAVE_MOD_ARCH_SPECIFIC
+ 	select HAVE_MOVE_PMD
++	select HAVE_MOVE_PUD
+ 	select HAVE_NMI
+ 	select HAVE_OPROFILE
+ 	select HAVE_OPTPROBES
+
+From 1f95a1802ca82a097311562931a78f19ed1bf485 Mon Sep 17 00:00:00 2001
+From: Ralph Campbell <rcampbell@nvidia.com>
+Date: Mon, 14 Dec 2020 19:12:55 -0800
+Subject: [PATCH 08/17] mm/migrate.c: optimize migrate_vma_pages() mmu notifier
+
+When migrating a zero page or pte_none() anonymous page to device private
+memory, migrate_vma_setup() will initialize the src[] array with a NULL
+PFN.  This lets the device driver allocate device private memory and clear
+it instead of DMAing a page of zeros over the device bus.
+
+Since the source page didn't exist at the time, no struct page was locked
+nor a migration PTE inserted into the CPU page tables.  The actual PTE
+insertion happens in migrate_vma_pages() when it tries to insert the
+device private struct page PTE into the CPU page tables.
+migrate_vma_pages() has to call the mmu notifiers again since another
+device could fault on the same page before the page table locks are
+acquired.
+
+Allow device drivers to optimize the invalidation similar to
+migrate_vma_setup() by calling mmu_notifier_range_init() which sets struct
+mmu_notifier_range event type to MMU_NOTIFY_MIGRATE and the
+migrate_pgmap_owner field.
+
+Link: https://lkml.kernel.org/r/20201021191335.10916-1-rcampbell@nvidia.com
+Signed-off-by: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ mm/migrate.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 5795cb82e27c3..defe3868a5872 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -3003,11 +3003,10 @@ void migrate_vma_pages(struct migrate_vma *migrate)
+ 			if (!notified) {
+ 				notified = true;
+ 
+-				mmu_notifier_range_init(&range,
+-							MMU_NOTIFY_CLEAR, 0,
+-							NULL,
+-							migrate->vma->vm_mm,
+-							addr, migrate->end);
++				mmu_notifier_range_init_migrate(&range, 0,
++					migrate->vma, migrate->vma->vm_mm,
++					addr, migrate->end,
++					migrate->pgmap_owner);
+ 				mmu_notifier_invalidate_range_start(&range);
+ 			}
+ 			migrate_vma_insert_page(migrate, addr, newpage,
+
+From afdf605d491d39cf0df167985d1bf09747c22f14 Mon Sep 17 00:00:00 2001
+From: Christophe Leroy <christophe.leroy@csgroup.eu>
+Date: Tue, 15 Dec 2020 20:42:45 -0800
+Subject: [PATCH 09/17] asm-generic: force inlining of get_order() to work
+ around gcc10 poor decision
+
+When building mpc885_ads_defconfig with gcc 10.1,
+the function get_order() appears 50 times in vmlinux:
+
+  [linux]# ppc-linux-objdump -x vmlinux | grep get_order | wc -l
+  50
+
+  [linux]# size vmlinux
+     text	   data	    bss	    dec	    hex	filename
+  3842620	 675624	 135160	4653404	 47015c	vmlinux
+
+In the old days, marking a function 'static inline' was forcing GCC to
+inline, but since commit ac7c3e4ff401 ("compiler: enable
+CONFIG_OPTIMIZE_INLINING forcibly") GCC may decide to not inline a
+function.
+
+It looks like GCC 10 is taking poor decisions on this.
+
+get_order() compiles into the following tiny function, occupying 20
+bytes of text.
+
+  0000007c <get_order>:
+    7c:   38 63 ff ff     addi    r3,r3,-1
+    80:   54 63 a3 3e     rlwinm  r3,r3,20,12,31
+    84:   7c 63 00 34     cntlzw  r3,r3
+    88:   20 63 00 20     subfic  r3,r3,32
+    8c:   4e 80 00 20     blr
+
+By forcing get_order() to be __always_inline, the size of text is
+reduced by 1940 bytes, that is almost twice the space occupied by
+50 times get_order()
+
+  [linux-powerpc]# size vmlinux
+     text	   data	    bss	    dec	    hex	filename
+  3840680	 675588	 135176	4651444	 46f9b4	vmlinux
+
+Link: https://lkml.kernel.org/r/96c6172d619c51acc5c1c4884b80785c59af4102.1602949927.git.christophe.leroy@csgroup.eu
+Signed-off-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+Reviewed-by: Joel Stanley <joel@jms.id.au>
+Cc: Segher Boessenkool <segher@kernel.crashing.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Masahiro Yamada <yamada.masahiro@socionext.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ include/asm-generic/getorder.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/asm-generic/getorder.h b/include/asm-generic/getorder.h
+index e9f20b813a699..f2979e3a96b60 100644
+--- a/include/asm-generic/getorder.h
++++ b/include/asm-generic/getorder.h
+@@ -26,7 +26,7 @@
+  *
+  * The result is undefined if the size is 0.
+  */
+-static inline __attribute_const__ int get_order(unsigned long size)
++static __always_inline __attribute_const__ int get_order(unsigned long size)
+ {
+ 	if (__builtin_constant_p(size)) {
+ 		if (!size)
+
+From 73aefbc694eef87861494aad51913fb9692f4ecc Mon Sep 17 00:00:00 2001
+From: Gao Xiang <hsiangkao@redhat.com>
+Date: Tue, 15 Dec 2020 20:44:03 -0800
+Subject: [PATCH 10/17] lib/lz4: explicitly support in-place decompression
+
+LZ4 final literal copy could be overlapped when doing
+in-place decompression, so it's unsafe to just use memcpy()
+on an optimized memcpy approach but memmove() instead.
+
+Upstream LZ4 has updated this years ago [1] (and the impact
+is non-sensible [2] plus only a few bytes remain), this commit
+just synchronizes LZ4 upstream code to the kernel side as well.
+
+It can be observed as EROFS in-place decompression failure
+on specific files when X86_FEATURE_ERMS is unsupported,
+memcpy() optimization of commit 59daa706fbec ("x86, mem:
+Optimize memcpy by avoiding memory false dependece") will
+be enabled then.
+
+Currently most modern x86-CPUs support ERMS, these CPUs just
+use "rep movsb" approach so no problem at all. However, it can
+still be verified with forcely disabling ERMS feature...
+
+arch/x86/lib/memcpy_64.S:
+        ALTERNATIVE_2 "jmp memcpy_orig", "", X86_FEATURE_REP_GOOD, \
+-                     "jmp memcpy_erms", X86_FEATURE_ERMS
++                     "jmp memcpy_orig", X86_FEATURE_ERMS
+
+We didn't observe any strange on arm64/arm/x86 platform before
+since most memcpy() would behave in an increasing address order
+("copy upwards" [3]) and it's the correct order of in-place
+decompression but it really needs an update to memmove() for sure
+considering it's an undefined behavior according to the standard
+and some unique optimization already exists in the kernel.
+
+[1] https://github.com/lz4/lz4/commit/33cb8518ac385835cc17be9a770b27b40cd0e15b
+[2] https://github.com/lz4/lz4/pull/717#issuecomment-497818921
+[3] https://sourceware.org/bugzilla/show_bug.cgi?id=12518
+
+Link: https://lkml.kernel.org/r/20201122030749.2698994-1-hsiangkao@redhat.com
+Signed-off-by: Gao Xiang <hsiangkao@redhat.com>
+Reviewed-by: Nick Terrell <terrelln@fb.com>
+Cc: Yann Collet <yann.collet.73@gmail.com>
+Cc: Miao Xie <miaoxie@huawei.com>
+Cc: Chao Yu <yuchao0@huawei.com>
+Cc: Li Guifu <bluce.liguifu@huawei.com>
+Cc: Guo Xuenan <guoxuenan@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ lib/lz4/lz4_decompress.c | 6 +++++-
+ lib/lz4/lz4defs.h        | 1 +
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/lib/lz4/lz4_decompress.c b/lib/lz4/lz4_decompress.c
+index 00cb0d0b73e16..8a7724a6ce2fb 100644
+--- a/lib/lz4/lz4_decompress.c
++++ b/lib/lz4/lz4_decompress.c
+@@ -263,7 +263,11 @@ static FORCE_INLINE int LZ4_decompress_generic(
+ 				}
+ 			}
+ 
+-			LZ4_memcpy(op, ip, length);
++			/*
++			 * supports overlapping memory regions; only matters
++			 * for in-place decompression scenarios
++			 */
++			LZ4_memmove(op, ip, length);
+ 			ip += length;
+ 			op += length;
+ 
+diff --git a/lib/lz4/lz4defs.h b/lib/lz4/lz4defs.h
+index c91dd96ef6291..673bd206aa98b 100644
+--- a/lib/lz4/lz4defs.h
++++ b/lib/lz4/lz4defs.h
+@@ -146,6 +146,7 @@ static FORCE_INLINE void LZ4_writeLE16(void *memPtr, U16 value)
+  * environments. This is needed when decompressing the Linux Kernel, for example.
+  */
+ #define LZ4_memcpy(dst, src, size) __builtin_memcpy(dst, src, size)
++#define LZ4_memmove(dst, src, size) __builtin_memmove(dst, src, size)
+ 
+ static FORCE_INLINE void LZ4_copy8(void *dst, const void *src)
+ {
+
+From fee3068bb888d046314ac25126af17318d10bdfc Mon Sep 17 00:00:00 2001
+From: Yuqi Jin <jinyuqi@huawei.com>
+Date: Thu, 17 Dec 2020 07:55:56 +1100
+Subject: [PATCH 11/17] lib: optimize cpumask_local_spread()
+
+In multi-processor and NUMA system, I/O driver will find cpu cores that
+which shall be bound IRQ.  When cpu cores in the local numa have been used
+up, it is better to find the node closest to the local numa node for
+performance, instead of choosing any online cpu immediately.
+
+On arm64 or x86 platform that has 2-sockets and 4-NUMA nodes, if the
+network card is located in node2 of socket1, while the number queues of
+network card is greater than the number of cores of node2, when all cores
+of node2 has been bound to the queues, the remaining queues will be bound
+to the cores of node0 which is further than NUMA node3.  It is not
+friendly for performance or Intel's DDIO (Data Direct I/O Technology) when
+if the user enables SNC (sub-NUMA-clustering).  Let's improve it and find
+the nearest unused node through NUMA distance for the non-local NUMA
+nodes.
+
+On Huawei Kunpeng 920 server, there are 4 NUMA node(0 - 3) in the 2-cpu
+system(0 - 1). The topology of this server is followed:
+available: 4 nodes (0-3)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+node 0 size: 63379 MB
+node 0 free: 61899 MB
+node 1 cpus: 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+node 1 size: 64509 MB
+node 1 free: 63942 MB
+node 2 cpus: 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71
+node 2 size: 64509 MB
+node 2 free: 63056 MB
+node 3 cpus: 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95
+node 3 size: 63997 MB
+node 3 free: 63420 MB
+node distances:
+node   0   1   2   3
+  0:  10  16  32  33
+  1:  16  10  25  32
+  2:  32  25  10  16
+  3:  33  32  16  10
+
+We perform PS (parameter server) business test, the behavior of the
+service is that the client initiates a request through the network card,
+the server responds to the request after calculation.  When two PS
+processes run on node2 and node3 separately and the network card is
+located on 'node2' which is in cpu1, the performance of node2 (26W QPS)
+and node3 (22W QPS) is different.
+
+It is better that the NIC queues are bound to the cpu1 cores in turn, then
+XPS will also be properly initialized, while cpumask_local_spread only
+considers the local node.  When the number of NIC queues exceeds the
+number of cores in the local node, it returns to the online core directly.
+So when PS runs on node3 sending a calculated request, the performance is
+not as good as the node2.
+
+The IRQ from 369-392 will be bound from NUMA node0 to NUMA node3 with this
+patch, before the patch:
+
+Euler:/sys/bus/pci # cat /proc/irq/369/smp_affinity_list
+0
+Euler:/sys/bus/pci # cat /proc/irq/370/smp_affinity_list
+1
+...
+Euler:/sys/bus/pci # cat /proc/irq/391/smp_affinity_list
+22
+Euler:/sys/bus/pci # cat /proc/irq/392/smp_affinity_list
+23
+After the patch:
+Euler:/sys/bus/pci # cat /proc/irq/369/smp_affinity_list
+72
+Euler:/sys/bus/pci # cat /proc/irq/370/smp_affinity_list
+73
+...
+Euler:/sys/bus/pci # cat /proc/irq/391/smp_affinity_list
+94
+Euler:/sys/bus/pci # cat /proc/irq/392/smp_affinity_list
+95
+
+So the performance of the node3 is the same as node2 that is 26W QPS when
+the network card is still in 'node2' with the patch.
+
+Link: https://lkml.kernel.org/r/1605668072-44780-1-git-send-email-zhangshaokun@hisilicon.com
+Signed-off-by: Yuqi Jin <jinyuqi@huawei.com>
+Signed-off-by: Shaokun Zhang <zhangshaokun@hisilicon.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Rusty Russell <rusty@rustcorp.com.au>
+Cc: Juergen Gross <jgross@suse.com>
+Cc: Paul Burton <paul.burton@mips.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Mike Rapoport <rppt@linux.ibm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+---
+ lib/cpumask.c | 60 ++++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 47 insertions(+), 13 deletions(-)
+
+diff --git a/lib/cpumask.c b/lib/cpumask.c
+index 85da6ab4fbb5a..57e414c361fed 100644
+--- a/lib/cpumask.c
++++ b/lib/cpumask.c
+@@ -193,20 +193,47 @@ void __init free_bootmem_cpumask_var(cpumask_var_t mask)
+ }
+ #endif
+ 
++static int find_nearest_node(int node, bool *used)
++{
++	int i, min_dist, node_id = -1;
++
++	/* Choose the first unused node to compare */
++	for (i = 0; i < nr_node_ids; i++) {
++		if (used[i] == false) {
++			min_dist = node_distance(node, i);
++			node_id = i;
++			break;
++		}
++	}
++
++	/* Compare and return the nearest node */
++	for (i = 0; i < nr_node_ids; i++) {
++		if (node_distance(node, i) < min_dist && used[i] == false) {
++			min_dist = node_distance(node, i);
++			node_id = i;
++		}
++	}
++
++	return node_id;
++}
++
+ /**
+  * cpumask_local_spread - select the i'th cpu with local numa cpu's first
+  * @i: index number
+  * @node: local numa_node
+  *
+  * This function selects an online CPU according to a numa aware policy;
+- * local cpus are returned first, followed by non-local ones, then it
+- * wraps around.
++ * local cpus are returned first, followed by the next one which is the
++ * nearest unused NUMA node based on NUMA distance, then it wraps around.
+  *
+  * It's not very efficient, but useful for setup.
+  */
+ unsigned int cpumask_local_spread(unsigned int i, int node)
+ {
+-	int cpu, hk_flags;
++	static DEFINE_SPINLOCK(spread_lock);
++	static bool used[MAX_NUMNODES];
++	unsigned long flags;
++	int cpu, hk_flags, j, id;
+ 	const struct cpumask *mask;
+ 
+ 	hk_flags = HK_FLAG_DOMAIN | HK_FLAG_MANAGED_IRQ;
+@@ -220,20 +247,27 @@ unsigned int cpumask_local_spread(unsigned int i, int node)
+ 				return cpu;
+ 		}
+ 	} else {
+-		/* NUMA first. */
+-		for_each_cpu_and(cpu, cpumask_of_node(node), mask) {
+-			if (i-- == 0)
+-				return cpu;
+-		}
++		spin_lock_irqsave(&spread_lock, flags);
++		memset(used, 0, nr_node_ids * sizeof(bool));
++		/* select node according to the distance from local node */
++		for (j = 0; j < nr_node_ids; j++) {
++			id = find_nearest_node(node, used);
++			if (id < 0)
++				break;
+ 
+-		for_each_cpu(cpu, mask) {
+-			/* Skip NUMA nodes, done above. */
+-			if (cpumask_test_cpu(cpu, cpumask_of_node(node)))
+-				continue;
++			for_each_cpu_and(cpu, cpumask_of_node(id), mask)
++				if (i-- == 0) {
++					spin_unlock_irqrestore(&spread_lock,
++							       flags);
++					return cpu;
++				}
++			used[id] = true;
++		}
++		spin_unlock_irqrestore(&spread_lock, flags);
+ 
++		for_each_cpu(cpu, mask)
+ 			if (i-- == 0)
+ 				return cpu;
+-		}
+ 	}
+ 	BUG();
+ }
+
+From 0990137532be7de67cd4412441abb8cd67a6eaa9 Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Thu, 17 Dec 2020 07:55:57 +1100
+Subject: [PATCH 12/17] aio: simplify read_events()
+
+Change wait_event_hrtimeout() to not call __wait_event_hrtimeout() if
+timeout == 0, this matches other _timeout() helpers in wait.h.
+
+This allows to simplify its only user, read_events(), it no longer needs
+to optimize the "until == 0" case by hand.
+
+Note: this patch doesn't use ___wait_cond_timeout because _hrtimeout()
+also differs in that it returns 0 if succeeds and -ETIME on timeout.
+Perhaps we should change this to make it fully compatible with other
+helpers.
+
+Link: http://lkml.kernel.org/r/20190607175413.GA29187@redhat.com
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Benjamin LaHaise <bcrl@kvack.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: David Laight <David.Laight@ACULAB.COM>
+Cc: Deepa Dinamani <deepa.kernel@gmail.com>
+Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+Cc: Eric Wong <e@80x24.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+---
+ fs/aio.c             | 9 +++------
+ include/linux/wait.h | 4 ++--
+ 2 files changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/fs/aio.c b/fs/aio.c
+index 6a21d8919409c..7c8cd976931bb 100644
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -1287,12 +1287,9 @@ static long read_events(struct kioctx *ctx, long min_nr, long nr,
+ 	 * the ringbuffer empty. So in practice we should be ok, but it's
+ 	 * something to be aware of when touching this code.
+ 	 */
+-	if (until == 0)
+-		aio_read_events(ctx, min_nr, nr, event, &ret);
+-	else
+-		wait_event_interruptible_hrtimeout(ctx->wait,
+-				aio_read_events(ctx, min_nr, nr, event, &ret),
+-				until);
++	wait_event_interruptible_hrtimeout(ctx->wait,
++			aio_read_events(ctx, min_nr, nr, event, &ret),
++			until);
+ 	return ret;
+ }
+ 
+diff --git a/include/linux/wait.h b/include/linux/wait.h
+index 27fb99cfeb026..57ccf26d3b96c 100644
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -545,7 +545,7 @@ do {										\
+ ({										\
+ 	int __ret = 0;								\
+ 	might_sleep();								\
+-	if (!(condition))							\
++	if (!(condition) && (timeout))						\
+ 		__ret = __wait_event_hrtimeout(wq_head, condition, timeout,	\
+ 					       TASK_UNINTERRUPTIBLE);		\
+ 	__ret;									\
+@@ -571,7 +571,7 @@ do {										\
+ ({										\
+ 	long __ret = 0;								\
+ 	might_sleep();								\
+-	if (!(condition))							\
++	if (!(condition) && (timeout))						\
+ 		__ret = __wait_event_hrtimeout(wq, condition, timeout,		\
+ 					       TASK_INTERRUPTIBLE);		\
+ 	__ret;									\
+
+From eb05b711301aac7c3477dfa6127e35e1e2a2f5f0 Mon Sep 17 00:00:00 2001
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date: Fri, 4 Dec 2020 20:13:54 +0100
+Subject: [PATCH 13/17] blk-mq: Don't complete on a remote CPU in force
+ threaded mode
+
+With force threaded interrupts enabled, raising softirq from an SMP
+function call will always result in waking the ksoftirqd thread. This is
+not optimal given that the thread runs at SCHED_OTHER priority.
+
+Completing the request in hard IRQ-context on PREEMPT_RT (which enforces
+the force threaded mode) is bad because the completion handler may
+acquire sleeping locks which violate the locking context.
+
+Disable request completing on a remote CPU in force threaded mode.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Daniel Wagner <dwagner@suse.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ block/blk-mq.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 55bcee5dc0320..421a40968c9ff 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -648,6 +648,14 @@ static inline bool blk_mq_complete_need_ipi(struct request *rq)
+ 	if (!IS_ENABLED(CONFIG_SMP) ||
+ 	    !test_bit(QUEUE_FLAG_SAME_COMP, &rq->q->queue_flags))
+ 		return false;
++	/*
++	 * With force threaded interrupts enabled, raising softirq from an SMP
++	 * function call will always result in waking the ksoftirqd thread.
++	 * This is probably worse than completing the request on a different
++	 * cache domain.
++	 */
++	if (force_irqthreads)
++		return false;
+ 
+ 	/* same CPU or cache domain?  Complete locally */
+ 	if (cpu == rq->mq_ctx->cpu ||
+
+From ae194fd3dae2a427b6788811b8ab1c7e1065a793 Mon Sep 17 00:00:00 2001
+From: intersectRaven <rjgolo@gmail.com>
+Date: Sun, 27 Dec 2020 18:10:51 +0800
+Subject: [PATCH 14/17] Revert "PCI/PM Runtime: Make runtime PM of PCI devices
+ inactive by default"
+
+This reverts commit bb910a7040e90a0ca3d3e8245d6d5c128a5d1287.
+---
+ drivers/pci/pci.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index e578d34095e91..b4c06d4766bfd 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -3003,7 +3003,6 @@ void pci_pm_init(struct pci_dev *dev)
+ 	u16 status;
+ 	u16 pmc;
+ 
+-	pm_runtime_forbid(&dev->dev);
+ 	pm_runtime_set_active(&dev->dev);
+ 	pm_runtime_enable(&dev->dev);
+ 	device_enable_async_suspend(&dev->dev);
+
+From e866fcdeb9bcd54172de67f2e0efd9fbe4b4a819 Mon Sep 17 00:00:00 2001
+From: Yuqi Jin <jinyuqi@huawei.com>
+Date: Tue, 5 Jan 2021 12:10:18 +1100
+Subject: [PATCH 15/17] lib-optimize-cpumask_local_spread-v8
+
+    1. Fix confusing comments
+    2. Improve the loop for choosing the nearest node.
+
+Link: https://lkml.kernel.org/r/1609759109-62925-1-git-send-email-zhangshaokun@hisilicon.com
+Signed-off-by: Yuqi Jin <jinyuqi@huawei.com>
+Signed-off-by: Shaokun Zhang <zhangshaokun@hisilicon.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Rusty Russell <rusty@rustcorp.com.au>
+Cc: Juergen Gross <jgross@suse.com>
+Cc: Paul Burton <paul.burton@mips.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Mike Rapoport <rppt@linux.ibm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+---
+ include/linux/cpumask.h |  2 +-
+ lib/cpumask.c           | 61 +++++++++++++++++++++--------------------
+ 2 files changed, 32 insertions(+), 31 deletions(-)
+
+diff --git a/include/linux/cpumask.h b/include/linux/cpumask.h
+index f0d895d6ac39f..6384d4dcc0e06 100644
+--- a/include/linux/cpumask.h
++++ b/include/linux/cpumask.h
+@@ -189,7 +189,7 @@ static inline unsigned int cpumask_any_but(const struct cpumask *mask,
+ 	return 1;
+ }
+ 
+-static inline unsigned int cpumask_local_spread(unsigned int i, int node)
++static inline unsigned int cpumask_local_spread(unsigned int cpu_index, int node)
+ {
+ 	return 0;
+ }
+diff --git a/lib/cpumask.c b/lib/cpumask.c
+index 57e414c361fed..6ffb25554f382 100644
+--- a/lib/cpumask.c
++++ b/lib/cpumask.c
+@@ -193,80 +193,81 @@ void __init free_bootmem_cpumask_var(cpumask_var_t mask)
+ }
+ #endif
+ 
+-static int find_nearest_node(int node, bool *used)
++static int find_nearest_node(int node, nodemask_t nodes)
+ {
+ 	int i, min_dist, node_id = -1;
+ 
+ 	/* Choose the first unused node to compare */
+-	for (i = 0; i < nr_node_ids; i++) {
+-		if (used[i] == false) {
++	for (i = 0; i < nr_node_ids; i++)
++		if (!node_isset(i, nodes)) {
+ 			min_dist = node_distance(node, i);
+ 			node_id = i;
+ 			break;
+ 		}
+-	}
+ 
+ 	/* Compare and return the nearest node */
+-	for (i = 0; i < nr_node_ids; i++) {
+-		if (node_distance(node, i) < min_dist && used[i] == false) {
++	for (i = 0; i < nr_node_ids; i++)
++		if (!node_isset(i, nodes) &&
++			node_distance(node, i) < min_dist) {
+ 			min_dist = node_distance(node, i);
+ 			node_id = i;
+ 		}
+-	}
+ 
+ 	return node_id;
+ }
+ 
+ /**
+  * cpumask_local_spread - select the i'th cpu with local numa cpu's first
+- * @i: index number
++ * @cpu_index: index number
+  * @node: local numa_node
+  *
+  * This function selects an online CPU according to a numa aware policy;
+- * local cpus are returned first, followed by the next one which is the
+- * nearest unused NUMA node based on NUMA distance, then it wraps around.
++ * Loop through all the online CPUs on the system. Start with the CPUs on
++ * 'node', then fall back to CPUs on NUMA nodes which are increasingly far
++ * away.
+  *
+- * It's not very efficient, but useful for setup.
++ * This function is not very efficient, especially for large 'cpu_index'
++ * because it loops over the same CPUs on each call and does not remember
++ * its state from previous calls, but it is useful for setup.
+  */
+-unsigned int cpumask_local_spread(unsigned int i, int node)
++unsigned int cpumask_local_spread(unsigned int cpu_index, int node)
+ {
+-	static DEFINE_SPINLOCK(spread_lock);
+-	static bool used[MAX_NUMNODES];
+-	unsigned long flags;
+-	int cpu, hk_flags, j, id;
++	int cpu, hk_flags, j, ncpus, id;
+ 	const struct cpumask *mask;
++	struct cpumask nmsk;
++	nodemask_t nodes_msk;
+ 
+ 	hk_flags = HK_FLAG_DOMAIN | HK_FLAG_MANAGED_IRQ;
+ 	mask = housekeeping_cpumask(hk_flags);
+ 	/* Wrap: we always want a cpu. */
+-	i %= cpumask_weight(mask);
++	cpu_index %= cpumask_weight(mask);
+ 
+ 	if (node == NUMA_NO_NODE) {
+ 		for_each_cpu(cpu, mask) {
+-			if (i-- == 0)
++			if (cpu_index-- == 0)
+ 				return cpu;
+ 		}
+ 	} else {
+-		spin_lock_irqsave(&spread_lock, flags);
+-		memset(used, 0, nr_node_ids * sizeof(bool));
+ 		/* select node according to the distance from local node */
++		nodes_clear(nodes_msk);
+ 		for (j = 0; j < nr_node_ids; j++) {
+-			id = find_nearest_node(node, used);
++			id = find_nearest_node(node, nodes_msk);
+ 			if (id < 0)
+ 				break;
+-
+-			for_each_cpu_and(cpu, cpumask_of_node(id), mask)
+-				if (i-- == 0) {
+-					spin_unlock_irqrestore(&spread_lock,
+-							       flags);
++			cpumask_and(&nmsk, mask, cpumask_of_node(id));
++			ncpus = cpumask_weight(&nmsk);
++			if (cpu_index >= ncpus) {
++				cpu_index -= ncpus;
++				node_set(id, nodes_msk);
++				continue;
++			}
++			for_each_cpu(cpu, &nmsk)
++				if (cpu_index-- == 0)
+ 					return cpu;
+-				}
+-			used[id] = true;
+ 		}
+-		spin_unlock_irqrestore(&spread_lock, flags);
+ 
+ 		for_each_cpu(cpu, mask)
+-			if (i-- == 0)
++			if (cpu_index-- == 0)
+ 				return cpu;
+ 	}
+ 	BUG();
+

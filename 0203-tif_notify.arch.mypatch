@@ -1,0 +1,3034 @@
+From 2d834be6e14a66355e65e433822dc44bcf38f06a Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 26 Oct 2020 14:32:27 -0600
+Subject: [PATCH 01/43] signal: Add task_sigpending() helper
+
+This is in preparation for maintaining signal_pending() as the decider of
+whether or not a schedule() loop should be broken, or continue sleeping.
+This is different than the core signal use cases, which really need to know
+whether an actual signal is pending or not. task_sigpending() returns
+non-zero if TIF_SIGPENDING is set.
+
+Only core kernel use cases should care about the distinction between
+the two, make sure those use the task_sigpending() helper.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+Link: https://lore.kernel.org/r/20201026203230.386348-2-axboe@kernel.dk
+---
+ include/linux/sched/signal.h | 9 +++++++--
+ kernel/events/uprobes.c      | 2 +-
+ kernel/signal.c              | 8 ++++----
+ 3 files changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/sched/signal.h b/include/linux/sched/signal.h
+index 1bad18a1d8ba7..404145dc536e2 100644
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@ -353,11 +353,16 @@ static inline int restart_syscall(void)
+ 	return -ERESTARTNOINTR;
+ }
+ 
+-static inline int signal_pending(struct task_struct *p)
++static inline int task_sigpending(struct task_struct *p)
+ {
+ 	return unlikely(test_tsk_thread_flag(p,TIF_SIGPENDING));
+ }
+ 
++static inline int signal_pending(struct task_struct *p)
++{
++	return task_sigpending(p);
++}
++
+ static inline int __fatal_signal_pending(struct task_struct *p)
+ {
+ 	return unlikely(sigismember(&p->pending.signal, SIGKILL));
+@@ -365,7 +370,7 @@ static inline int __fatal_signal_pending(struct task_struct *p)
+ 
+ static inline int fatal_signal_pending(struct task_struct *p)
+ {
+-	return signal_pending(p) && __fatal_signal_pending(p);
++	return task_sigpending(p) && __fatal_signal_pending(p);
+ }
+ 
+ static inline int signal_pending_state(long state, struct task_struct *p)
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 00b0358739ab3..bf9edd8d75be5 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -1973,7 +1973,7 @@ bool uprobe_deny_signal(void)
+ 
+ 	WARN_ON_ONCE(utask->state != UTASK_SSTEP);
+ 
+-	if (signal_pending(t)) {
++	if (task_sigpending(t)) {
+ 		spin_lock_irq(&t->sighand->siglock);
+ 		clear_tsk_thread_flag(t, TIF_SIGPENDING);
+ 		spin_unlock_irq(&t->sighand->siglock);
+diff --git a/kernel/signal.c b/kernel/signal.c
+index ef8f2a28d37c5..456bc61b28c9c 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -984,7 +984,7 @@ static inline bool wants_signal(int sig, struct task_struct *p)
+ 	if (task_is_stopped_or_traced(p))
+ 		return false;
+ 
+-	return task_curr(p) || !signal_pending(p);
++	return task_curr(p) || !task_sigpending(p);
+ }
+ 
+ static void complete_signal(int sig, struct task_struct *p, enum pid_type type)
+@@ -2823,7 +2823,7 @@ static void retarget_shared_pending(struct task_struct *tsk, sigset_t *which)
+ 		/* Remove the signals this thread can handle. */
+ 		sigandsets(&retarget, &retarget, &t->blocked);
+ 
+-		if (!signal_pending(t))
++		if (!task_sigpending(t))
+ 			signal_wake_up(t, 0);
+ 
+ 		if (sigisemptyset(&retarget))
+@@ -2857,7 +2857,7 @@ void exit_signals(struct task_struct *tsk)
+ 
+ 	cgroup_threadgroup_change_end(tsk);
+ 
+-	if (!signal_pending(tsk))
++	if (!task_sigpending(tsk))
+ 		goto out;
+ 
+ 	unblocked = tsk->blocked;
+@@ -2901,7 +2901,7 @@ long do_no_restart_syscall(struct restart_block *param)
+ 
+ static void __set_task_blocked(struct task_struct *tsk, const sigset_t *newset)
+ {
+-	if (signal_pending(tsk) && !thread_group_empty(tsk)) {
++	if (task_sigpending(tsk) && !thread_group_empty(tsk)) {
+ 		sigset_t newblocked;
+ 		/* A set of now blocked but previously unblocked signals. */
+ 		sigandnsets(&newblocked, newset, &current->blocked);
+
+From 8403b36030802dcb0099c6a517ef1bdfd0323097 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 26 Oct 2020 14:32:28 -0600
+Subject: [PATCH 02/43] entry: Add support for TIF_NOTIFY_SIGNAL
+
+Add TIF_NOTIFY_SIGNAL handling in the generic entry code, which if set,
+will return true if signal_pending() is used in a wait loop. That causes an
+exit of the loop so that notify_signal tracehooks can be run. If the wait
+loop is currently inside a system call, the system call is restarted once
+task_work has been processed.
+
+In preparation for only having arch_do_signal() handle syscall restarts if
+_TIF_SIGPENDING isn't set, rename it to arch_do_signal_or_restart().  Pass
+in a boolean that tells the architecture specific signal handler if it
+should attempt to get a signal, or just process a potential syscall
+restart.
+
+For !CONFIG_GENERIC_ENTRY archs, add the TIF_NOTIFY_SIGNAL handling to
+get_signal(). This is done to minimize the needed architecture changes to
+support this feature.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+Link: https://lore.kernel.org/r/20201026203230.386348-3-axboe@kernel.dk
+---
+ arch/x86/kernel/signal.c     |  4 ++--
+ include/linux/entry-common.h | 11 ++++++++---
+ include/linux/entry-kvm.h    |  4 ++--
+ include/linux/sched/signal.h | 11 ++++++++++-
+ include/linux/tracehook.h    | 27 +++++++++++++++++++++++++++
+ kernel/entry/common.c        | 14 +++++++++++---
+ kernel/entry/kvm.c           |  3 +++
+ kernel/signal.c              | 14 ++++++++++++++
+ 8 files changed, 77 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kernel/signal.c b/arch/x86/kernel/signal.c
+index be0d7d4152eca..ea794a083c44e 100644
+--- a/arch/x86/kernel/signal.c
++++ b/arch/x86/kernel/signal.c
+@@ -804,11 +804,11 @@ static inline unsigned long get_nr_restart_syscall(const struct pt_regs *regs)
+  * want to handle. Thus you cannot kill init even with a SIGKILL even by
+  * mistake.
+  */
+-void arch_do_signal(struct pt_regs *regs)
++void arch_do_signal_or_restart(struct pt_regs *regs, bool has_signal)
+ {
+ 	struct ksignal ksig;
+ 
+-	if (get_signal(&ksig)) {
++	if (has_signal && get_signal(&ksig)) {
+ 		/* Whee! Actually deliver the signal.  */
+ 		handle_signal(&ksig, regs);
+ 		return;
+diff --git a/include/linux/entry-common.h b/include/linux/entry-common.h
+index 474f29638d2c9..b9711e813ec2d 100644
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@ -37,6 +37,10 @@
+ # define _TIF_UPROBE			(0)
+ #endif
+ 
++#ifndef _TIF_NOTIFY_SIGNAL
++# define _TIF_NOTIFY_SIGNAL		(0)
++#endif
++
+ /*
+  * TIF flags handled in syscall_enter_from_user_mode()
+  */
+@@ -69,7 +73,7 @@
+ 
+ #define EXIT_TO_USER_MODE_WORK						\
+ 	(_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_UPROBE |		\
+-	 _TIF_NEED_RESCHED | _TIF_PATCH_PENDING |			\
++	 _TIF_NEED_RESCHED | _TIF_PATCH_PENDING | _TIF_NOTIFY_SIGNAL |	\
+ 	 ARCH_EXIT_TO_USER_MODE_WORK)
+ 
+ /**
+@@ -259,12 +263,13 @@ static __always_inline void arch_exit_to_user_mode(void) { }
+ #endif
+ 
+ /**
+- * arch_do_signal -  Architecture specific signal delivery function
++ * arch_do_signal_or_restart -  Architecture specific signal delivery function
+  * @regs:	Pointer to currents pt_regs
++ * @has_signal:	actual signal to handle
+  *
+  * Invoked from exit_to_user_mode_loop().
+  */
+-void arch_do_signal(struct pt_regs *regs);
++void arch_do_signal_or_restart(struct pt_regs *regs, bool has_signal);
+ 
+ /**
+  * arch_syscall_exit_tracehook - Wrapper around tracehook_report_syscall_exit()
+diff --git a/include/linux/entry-kvm.h b/include/linux/entry-kvm.h
+index 0cef17afb41a6..9b93f8584ff7d 100644
+--- a/include/linux/entry-kvm.h
++++ b/include/linux/entry-kvm.h
+@@ -11,8 +11,8 @@
+ # define ARCH_XFER_TO_GUEST_MODE_WORK	(0)
+ #endif
+ 
+-#define XFER_TO_GUEST_MODE_WORK					\
+-	(_TIF_NEED_RESCHED | _TIF_SIGPENDING |			\
++#define XFER_TO_GUEST_MODE_WORK						\
++	(_TIF_NEED_RESCHED | _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL |	\
+ 	 _TIF_NOTIFY_RESUME | ARCH_XFER_TO_GUEST_MODE_WORK)
+ 
+ struct kvm_vcpu;
+diff --git a/include/linux/sched/signal.h b/include/linux/sched/signal.h
+index 404145dc536e2..bd5afa0761897 100644
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@ -360,6 +360,15 @@ static inline int task_sigpending(struct task_struct *p)
+ 
+ static inline int signal_pending(struct task_struct *p)
+ {
++#if defined(TIF_NOTIFY_SIGNAL)
++	/*
++	 * TIF_NOTIFY_SIGNAL isn't really a signal, but it requires the same
++	 * behavior in terms of ensuring that we break out of wait loops
++	 * so that notify signal callbacks can be processed.
++	 */
++	if (unlikely(test_tsk_thread_flag(p, TIF_NOTIFY_SIGNAL)))
++		return 1;
++#endif
+ 	return task_sigpending(p);
+ }
+ 
+@@ -507,7 +516,7 @@ extern int set_user_sigmask(const sigset_t __user *umask, size_t sigsetsize);
+ static inline void restore_saved_sigmask_unless(bool interrupted)
+ {
+ 	if (interrupted)
+-		WARN_ON(!test_thread_flag(TIF_SIGPENDING));
++		WARN_ON(!signal_pending(current));
+ 	else
+ 		restore_saved_sigmask();
+ }
+diff --git a/include/linux/tracehook.h b/include/linux/tracehook.h
+index b480e1a07ed85..f7d82e4fafd6c 100644
+--- a/include/linux/tracehook.h
++++ b/include/linux/tracehook.h
+@@ -198,4 +198,31 @@ static inline void tracehook_notify_resume(struct pt_regs *regs)
+ 	blkcg_maybe_throttle_current();
+ }
+ 
++/*
++ * called by exit_to_user_mode_loop() if ti_work & _TIF_NOTIFY_SIGNAL. This
++ * is currently used by TWA_SIGNAL based task_work, which requires breaking
++ * wait loops to ensure that task_work is noticed and run.
++ */
++static inline void tracehook_notify_signal(void)
++{
++#if defined(TIF_NOTIFY_SIGNAL)
++	clear_thread_flag(TIF_NOTIFY_SIGNAL);
++	smp_mb__after_atomic();
++	if (current->task_works)
++		task_work_run();
++#endif
++}
++
++/*
++ * Called when we have work to process from exit_to_user_mode_loop()
++ */
++static inline void set_notify_signal(struct task_struct *task)
++{
++#if defined(TIF_NOTIFY_SIGNAL)
++	if (!test_and_set_tsk_thread_flag(task, TIF_NOTIFY_SIGNAL) &&
++	    !wake_up_state(task, TASK_INTERRUPTIBLE))
++		kick_process(task);
++#endif
++}
++
+ #endif	/* <linux/tracehook.h> */
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index e9e2df3f3f9ee..33bb5f9f399cd 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -135,7 +135,15 @@ static __always_inline void exit_to_user_mode(void)
+ }
+ 
+ /* Workaround to allow gradual conversion of architecture code */
+-void __weak arch_do_signal(struct pt_regs *regs) { }
++void __weak arch_do_signal_or_restart(struct pt_regs *regs, bool has_signal) { }
++
++static void handle_signal_work(struct pt_regs *regs, unsigned long ti_work)
++{
++	if (ti_work & _TIF_NOTIFY_SIGNAL)
++		tracehook_notify_signal();
++
++	arch_do_signal_or_restart(regs, ti_work & _TIF_SIGPENDING);
++}
+ 
+ static unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
+ 					    unsigned long ti_work)
+@@ -157,8 +165,8 @@ static unsigned long exit_to_user_mode_loop(struct pt_regs *regs,
+ 		if (ti_work & _TIF_PATCH_PENDING)
+ 			klp_update_patch_state(current);
+ 
+-		if (ti_work & _TIF_SIGPENDING)
+-			arch_do_signal(regs);
++		if (ti_work & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
++			handle_signal_work(regs, ti_work);
+ 
+ 		if (ti_work & _TIF_NOTIFY_RESUME) {
+ 			tracehook_notify_resume(regs);
+diff --git a/kernel/entry/kvm.c b/kernel/entry/kvm.c
+index b6678a5e3cf64..49972ee99aff6 100644
+--- a/kernel/entry/kvm.c
++++ b/kernel/entry/kvm.c
+@@ -8,6 +8,9 @@ static int xfer_to_guest_mode_work(struct kvm_vcpu *vcpu, unsigned long ti_work)
+ 	do {
+ 		int ret;
+ 
++		if (ti_work & _TIF_NOTIFY_SIGNAL)
++			tracehook_notify_signal();
++
+ 		if (ti_work & _TIF_SIGPENDING) {
+ 			kvm_handle_signal_exit(vcpu);
+ 			return -EINTR;
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 456bc61b28c9c..923230ff6cfca 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2530,6 +2530,20 @@ bool get_signal(struct ksignal *ksig)
+ 	struct signal_struct *signal = current->signal;
+ 	int signr;
+ 
++	/*
++	 * For non-generic architectures, check for TIF_NOTIFY_SIGNAL so
++	 * that the arch handlers don't all have to do it. If we get here
++	 * without TIF_SIGPENDING, just exit after running signal work.
++	 */
++#ifdef TIF_NOTIFY_SIGNAL
++	if (!IS_ENABLED(CONFIG_GENERIC_ENTRY)) {
++		if (test_thread_flag(TIF_NOTIFY_SIGNAL))
++			tracehook_notify_signal();
++		if (!task_sigpending(current))
++			return false;
++	}
++#endif
++
+ 	if (unlikely(uprobe_deny_signal()))
+ 		return false;
+ 
+
+From f9ea7ccb3b75fb363e1bbc0e91d434a45f569478 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 26 Oct 2020 14:32:30 -0600
+Subject: [PATCH 03/43] task_work: Use TIF_NOTIFY_SIGNAL if available
+
+If the arch supports TIF_NOTIFY_SIGNAL, then use that for TWA_SIGNAL as
+it's more efficient than using the signal delivery method. This is
+especially true on threaded applications, where ->sighand is shared across
+threads, but it's also lighter weight on non-shared cases.
+
+io_uring is a heavy consumer of TWA_SIGNAL based task_work. A test with
+threads shows a nice improvement running an io_uring based echo server.
+
+stock kernel:
+0.01% <= 0.1 milliseconds
+95.86% <= 0.2 milliseconds
+98.27% <= 0.3 milliseconds
+99.71% <= 0.4 milliseconds
+100.00% <= 0.5 milliseconds
+100.00% <= 0.6 milliseconds
+100.00% <= 0.7 milliseconds
+100.00% <= 0.8 milliseconds
+100.00% <= 0.9 milliseconds
+100.00% <= 1.0 milliseconds
+100.00% <= 1.1 milliseconds
+100.00% <= 2 milliseconds
+100.00% <= 3 milliseconds
+100.00% <= 3 milliseconds
+1378930.00 requests per second
+~1600% CPU
+
+1.38M requests/second, and all 16 CPUs are maxed out.
+
+patched kernel:
+0.01% <= 0.1 milliseconds
+98.24% <= 0.2 milliseconds
+99.47% <= 0.3 milliseconds
+99.99% <= 0.4 milliseconds
+100.00% <= 0.5 milliseconds
+100.00% <= 0.6 milliseconds
+100.00% <= 0.7 milliseconds
+100.00% <= 0.8 milliseconds
+100.00% <= 0.9 milliseconds
+100.00% <= 1.2 milliseconds
+1666111.38 requests per second
+~1450% CPU
+
+1.67M requests/second, and we're no longer just hammering on the sighand
+lock. The original reporter states:
+
+"For 5.7.15 my benchmark achieves 1.6M qps and system cpu is at ~80%.
+ for 5.7.16 or later it achieves only 1M qps and the system cpu is is
+ at ~100%"
+
+with the only difference there being that TWA_SIGNAL is used
+unconditionally in 5.7.16, since it's required to be able to handle the
+inability to run task_work if the application is waiting in the kernel
+already on an event that needs task_work run to be satisfied. Also see
+commit 0ba9c9edcd15.
+
+Reported-by: Roman Gershman <romger@amazon.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+Link: https://lore.kernel.org/r/20201026203230.386348-5-axboe@kernel.dk
+---
+ kernel/task_work.c | 41 +++++++++++++++++++++++++++++------------
+ 1 file changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/kernel/task_work.c b/kernel/task_work.c
+index 8d6e1217c451c..15b087286bea4 100644
+--- a/kernel/task_work.c
++++ b/kernel/task_work.c
+@@ -5,6 +5,34 @@
+ 
+ static struct callback_head work_exited; /* all we need is ->next == NULL */
+ 
++/*
++ * TWA_SIGNAL signaling - use TIF_NOTIFY_SIGNAL, if available, as it's faster
++ * than TIF_SIGPENDING as there's no dependency on ->sighand. The latter is
++ * shared for threads, and can cause contention on sighand->lock. Even for
++ * the non-threaded case TIF_NOTIFY_SIGNAL is more efficient, as no locking
++ * or IRQ disabling is involved for notification (or running) purposes.
++ */
++static void task_work_notify_signal(struct task_struct *task)
++{
++#if defined(TIF_NOTIFY_SIGNAL)
++	set_notify_signal(task);
++#else
++	unsigned long flags;
++
++	/*
++	 * Only grab the sighand lock if we don't already have some
++	 * task_work pending. This pairs with the smp_store_mb()
++	 * in get_signal(), see comment there.
++	 */
++	if (!(READ_ONCE(task->jobctl) & JOBCTL_TASK_WORK) &&
++	    lock_task_sighand(task, &flags)) {
++		task->jobctl |= JOBCTL_TASK_WORK;
++		signal_wake_up(task, 0);
++		unlock_task_sighand(task, &flags);
++	}
++#endif
++}
++
+ /**
+  * task_work_add - ask the @task to execute @work->func()
+  * @task: the task which should run the callback
+@@ -33,7 +61,6 @@ int task_work_add(struct task_struct *task, struct callback_head *work,
+ 		  enum task_work_notify_mode notify)
+ {
+ 	struct callback_head *head;
+-	unsigned long flags;
+ 
+ 	do {
+ 		head = READ_ONCE(task->task_works);
+@@ -49,17 +76,7 @@ int task_work_add(struct task_struct *task, struct callback_head *work,
+ 		set_notify_resume(task);
+ 		break;
+ 	case TWA_SIGNAL:
+-		/*
+-		 * Only grab the sighand lock if we don't already have some
+-		 * task_work pending. This pairs with the smp_store_mb()
+-		 * in get_signal(), see comment there.
+-		 */
+-		if (!(READ_ONCE(task->jobctl) & JOBCTL_TASK_WORK) &&
+-		    lock_task_sighand(task, &flags)) {
+-			task->jobctl |= JOBCTL_TASK_WORK;
+-			signal_wake_up(task, 0);
+-			unlock_task_sighand(task, &flags);
+-		}
++		task_work_notify_signal(task);
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+
+From b4b46c51859af9ee2e9735ac2b94c53f3f54add9 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:27 -0400
+Subject: [PATCH 04/43] perf/x86: Avoid TIF_IA32 when checking 64bit mode
+
+In preparation to remove TIF_IA32, stop using it in perf events code.
+
+Tested by running perf on 32-bit, 64-bit and x32 applications.
+
+Suggested-by: Andy Lutomirski <luto@kernel.org>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20201004032536.1229030-2-krisman@collabora.com
+---
+ arch/x86/events/core.c      | 2 +-
+ arch/x86/events/intel/ds.c  | 2 +-
+ arch/x86/events/intel/lbr.c | 2 +-
+ arch/x86/kernel/perf_regs.c | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/events/core.c b/arch/x86/events/core.c
+index a88c94d656931..77b963e5e70af 100644
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -2602,7 +2602,7 @@ perf_callchain_user32(struct pt_regs *regs, struct perf_callchain_entry_ctx *ent
+ 	struct stack_frame_ia32 frame;
+ 	const struct stack_frame_ia32 __user *fp;
+ 
+-	if (!test_thread_flag(TIF_IA32))
++	if (user_64bit_mode(regs))
+ 		return 0;
+ 
+ 	cs_base = get_segment_base(regs->cs);
+diff --git a/arch/x86/events/intel/ds.c b/arch/x86/events/intel/ds.c
+index 485c5066f8b8c..a5c6ff5f1b4cc 100644
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -1261,7 +1261,7 @@ static int intel_pmu_pebs_fixup_ip(struct pt_regs *regs)
+ 		old_to = to;
+ 
+ #ifdef CONFIG_X86_64
+-		is_64bit = kernel_ip(to) || !test_thread_flag(TIF_IA32);
++		is_64bit = kernel_ip(to) || any_64bit_mode(regs);
+ #endif
+ 		insn_init(&insn, kaddr, size, is_64bit);
+ 		insn_get_length(&insn);
+diff --git a/arch/x86/events/intel/lbr.c b/arch/x86/events/intel/lbr.c
+index 8961653c5dd2b..1aadb253d296a 100644
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@ -1221,7 +1221,7 @@ static int branch_type(unsigned long from, unsigned long to, int abort)
+ 	 * on 64-bit systems running 32-bit apps
+ 	 */
+ #ifdef CONFIG_X86_64
+-	is64 = kernel_ip((unsigned long)addr) || !test_thread_flag(TIF_IA32);
++	is64 = kernel_ip((unsigned long)addr) || any_64bit_mode(current_pt_regs());
+ #endif
+ 	insn_init(&insn, addr, bytes_read, is64);
+ 	insn_get_opcode(&insn);
+diff --git a/arch/x86/kernel/perf_regs.c b/arch/x86/kernel/perf_regs.c
+index f9e5352b3bef9..624703af80a19 100644
+--- a/arch/x86/kernel/perf_regs.c
++++ b/arch/x86/kernel/perf_regs.c
+@@ -122,7 +122,7 @@ int perf_reg_validate(u64 mask)
+ 
+ u64 perf_reg_abi(struct task_struct *task)
+ {
+-	if (test_tsk_thread_flag(task, TIF_IA32))
++	if (!user_64bit_mode(task_pt_regs(task)))
+ 		return PERF_SAMPLE_REGS_ABI_32;
+ 	else
+ 		return PERF_SAMPLE_REGS_ABI_64;
+
+From eab39ebc09ff445e4b1c89da371822b26b5725b2 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:28 -0400
+Subject: [PATCH 05/43] x86/compat: Simplify compat syscall userspace
+ allocation
+
+When allocating user memory space for a compat system call, don't consider
+whether the originating code is IA32 or X32, just allocate from a safe
+region for both, beyond the redzone.  This should be safe for IA32, and has
+the benefit of avoiding TIF_IA32, which is about to be removed.
+
+Suggested-by: Andy Lutomirski <luto@kernel.org>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201004032536.1229030-3-krisman@collabora.com
+---
+ arch/x86/include/asm/compat.h | 15 +++++++--------
+ 1 file changed, 7 insertions(+), 8 deletions(-)
+
+diff --git a/arch/x86/include/asm/compat.h b/arch/x86/include/asm/compat.h
+index 0e327a01f50fb..f145e3326c6d7 100644
+--- a/arch/x86/include/asm/compat.h
++++ b/arch/x86/include/asm/compat.h
+@@ -177,14 +177,13 @@ typedef struct user_regs_struct compat_elf_gregset_t;
+ 
+ static inline void __user *arch_compat_alloc_user_space(long len)
+ {
+-	compat_uptr_t sp;
+-
+-	if (test_thread_flag(TIF_IA32)) {
+-		sp = task_pt_regs(current)->sp;
+-	} else {
+-		/* -128 for the x32 ABI redzone */
+-		sp = task_pt_regs(current)->sp - 128;
+-	}
++	compat_uptr_t sp = task_pt_regs(current)->sp;
++
++	/*
++	 * -128 for the x32 ABI redzone.  For IA32, it is not strictly
++	 * necessary, but not harmful.
++	 */
++	sp -= 128;
+ 
+ 	return (void __user *)round_down(sp - len, 16);
+ }
+
+From 24ddd7ec756395d39d19013739f11830c09d3f86 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:29 -0400
+Subject: [PATCH 06/43] x86/oprofile: Avoid TIF_IA32 when checking 64bit mode
+
+In preparation to remove TIF_IA32, stop using it in oprofile code. Use
+user_64bit_mode() instead.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201004032536.1229030-4-krisman@collabora.com
+---
+ arch/x86/oprofile/backtrace.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/oprofile/backtrace.c b/arch/x86/oprofile/backtrace.c
+index a2488b6e27d6c..1d8391fcca68f 100644
+--- a/arch/x86/oprofile/backtrace.c
++++ b/arch/x86/oprofile/backtrace.c
+@@ -49,7 +49,7 @@ x86_backtrace_32(struct pt_regs * const regs, unsigned int depth)
+ 	struct stack_frame_ia32 *head;
+ 
+ 	/* User process is IA32 */
+-	if (!current || !test_thread_flag(TIF_IA32))
++	if (!current || user_64bit_mode(regs))
+ 		return 0;
+ 
+ 	head = (struct stack_frame_ia32 *) regs->bp;
+
+From c8ece4d80715fb409576a8e41bbf8d504465bd8b Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:30 -0400
+Subject: [PATCH 07/43] x86/elf: Use e_machine to choose DLINFO in compat
+
+Since TIF_X32 is going away, avoid using it to find the ELF type on
+ARCH_DLINFO.
+
+According to SysV AMD64 ABI Draft, an AMD64 ELF object using ILP32 must
+have ELFCLASS32 with (E_MACHINE == EM_X86_64), so use that ELF field to
+differentiate a x32 object from a IA32 object when loading ARCH_DLINFO in
+compat mode.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Andy Lutomirski <luto@kernel.org>
+Link: https://lore.kernel.org/r/20201004032536.1229030-5-krisman@collabora.com
+---
+ arch/x86/include/asm/elf.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index b9a5d488f1a5e..9220efc65d78c 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -361,7 +361,7 @@ do {									\
+ #define AT_SYSINFO		32
+ 
+ #define COMPAT_ARCH_DLINFO						\
+-if (test_thread_flag(TIF_X32))						\
++if (exec->e_machine == EM_X86_64)					\
+ 	ARCH_DLINFO_X32;						\
+ else									\
+ 	ARCH_DLINFO_IA32
+
+From ed8fc6b7742fe47785ae80b0cab68ffe15fb37ae Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:31 -0400
+Subject: [PATCH 08/43] elf: Expose ELF header in compat_start_thread()
+
+Like it is done for SET_PERSONALITY with x86, which requires the ELF header
+to select correct personality parameters, x86 requires the headers on
+compat_start_thread() to choose starting CS for ELF32 binaries, instead of
+relying on the going-away TIF_IA32/X32 flags.
+
+Add an indirection macro to ELF invocations of START_THREAD, that x86 can
+reimplement to receive the extra parameter just for ELF files.  This
+requires no changes to other architectures who don't need the header
+information, they can continue to use the original start_thread for ELF and
+non-ELF binaries, and it prevents affecting non-ELF code paths for x86.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201004032536.1229030-6-krisman@collabora.com
+---
+ fs/binfmt_elf.c        | 2 +-
+ fs/compat_binfmt_elf.c | 9 +++++++--
+ include/linux/elf.h    | 5 +++++
+ 3 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index fa50e8936f5fc..c07736d50003b 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -1307,7 +1307,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ #endif
+ 
+ 	finalize_exec(bprm);
+-	start_thread(regs, elf_entry, bprm->p);
++	START_THREAD(elf_ex, regs, elf_entry, bprm->p);
+ 	retval = 0;
+ out:
+ 	return retval;
+diff --git a/fs/compat_binfmt_elf.c b/fs/compat_binfmt_elf.c
+index 2d24c765cbd7a..12b991368f0a5 100644
+--- a/fs/compat_binfmt_elf.c
++++ b/fs/compat_binfmt_elf.c
+@@ -106,8 +106,13 @@
+ #endif
+ 
+ #ifdef	compat_start_thread
+-#undef	start_thread
+-#define	start_thread		compat_start_thread
++#define COMPAT_START_THREAD(ex, regs, new_ip, new_sp)	\
++	compat_start_thread(regs, new_ip, new_sp)
++#endif
++
++#ifdef	COMPAT_START_THREAD
++#undef	START_THREAD
++#define START_THREAD		COMPAT_START_THREAD
+ #endif
+ 
+ #ifdef	compat_arch_setup_additional_pages
+diff --git a/include/linux/elf.h b/include/linux/elf.h
+index 5d5b0321da0bd..6dbcfe7a3fd73 100644
+--- a/include/linux/elf.h
++++ b/include/linux/elf.h
+@@ -22,6 +22,11 @@
+ 	SET_PERSONALITY(ex)
+ #endif
+ 
++#ifndef START_THREAD
++#define START_THREAD(elf_ex, regs, elf_entry, start_stack)	\
++	start_thread(regs, elf_entry, start_stack)
++#endif
++
+ #define ELF32_GNU_PROPERTY_ALIGN	4
+ #define ELF64_GNU_PROPERTY_ALIGN	8
+ 
+
+From 4e164312c7332202245576ff67fb9d143a431aa7 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:32 -0400
+Subject: [PATCH 09/43] x86/elf: Use e_machine to select start_thread for x32
+
+Since TIF_X32 is going away, avoid using it to find the ELF type in
+compat_start_thread.
+
+According to SysV AMD64 ABI Draft, an AMD64 ELF object using ILP32 must
+have ELFCLASS32 with (E_MACHINE == EM_X86_64), so use that ELF field to
+differentiate a x32 object from a IA32 object when executing start_thread()
+in compat mode.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Andy Lutomirski <luto@kernel.org>
+Link: https://lore.kernel.org/r/20201004032536.1229030-7-krisman@collabora.com
+---
+ arch/x86/include/asm/elf.h   | 5 +++--
+ arch/x86/kernel/process_64.c | 5 ++---
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index 9220efc65d78c..109697a19eb10 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -186,8 +186,9 @@ static inline void elf_common_init(struct thread_struct *t,
+ #define	COMPAT_ELF_PLAT_INIT(regs, load_addr)		\
+ 	elf_common_init(&current->thread, regs, __USER_DS)
+ 
+-void compat_start_thread(struct pt_regs *regs, u32 new_ip, u32 new_sp);
+-#define compat_start_thread compat_start_thread
++void compat_start_thread(struct pt_regs *regs, u32 new_ip, u32 new_sp, bool x32);
++#define COMPAT_START_THREAD(ex, regs, new_ip, new_sp)	\
++	compat_start_thread(regs, new_ip, new_sp, ex->e_machine == EM_X86_64)
+ 
+ void set_personality_ia32(bool);
+ #define COMPAT_SET_PERSONALITY(ex)			\
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index df342bedea88a..5fb4103101f51 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -511,11 +511,10 @@ start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
+ EXPORT_SYMBOL_GPL(start_thread);
+ 
+ #ifdef CONFIG_COMPAT
+-void compat_start_thread(struct pt_regs *regs, u32 new_ip, u32 new_sp)
++void compat_start_thread(struct pt_regs *regs, u32 new_ip, u32 new_sp, bool x32)
+ {
+ 	start_thread_common(regs, new_ip, new_sp,
+-			    test_thread_flag(TIF_X32)
+-			    ? __USER_CS : __USER32_CS,
++			    x32 ? __USER_CS : __USER32_CS,
+ 			    __USER_DS, __USER_DS);
+ }
+ #endif
+
+From 9eb28c77f4a180ebb37405eb1f4dfb433fcbbbd5 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:33 -0400
+Subject: [PATCH 10/43] elf: Expose ELF header on arch_setup_additional_pages()
+
+Like it is done for SET_PERSONALITY with ARM, which requires the ELF
+header to select correct personality parameters, x86 requires the
+headers when selecting which VDSO to load, instead of relying on the
+going-away TIF_IA32/X32 flags.
+
+Add an indirection macro to arch_setup_additional_pages(), that x86 can
+reimplement to receive the extra parameter just for ELF files.  This
+requires no changes to other architectures, who can continue to use the
+original arch_setup_additional_pages for ELF and non-ELF binaries.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201004032536.1229030-8-krisman@collabora.com
+---
+ fs/binfmt_elf.c        |  2 +-
+ fs/compat_binfmt_elf.c | 11 ++++++++---
+ include/linux/elf.h    |  5 +++++
+ 3 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index c07736d50003b..ac0b5fc30ea6a 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -1246,7 +1246,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	set_binfmt(&elf_format);
+ 
+ #ifdef ARCH_HAS_SETUP_ADDITIONAL_PAGES
+-	retval = arch_setup_additional_pages(bprm, !!interpreter);
++	retval = ARCH_SETUP_ADDITIONAL_PAGES(bprm, elf_ex, !!interpreter);
+ 	if (retval < 0)
+ 		goto out;
+ #endif /* ARCH_HAS_SETUP_ADDITIONAL_PAGES */
+diff --git a/fs/compat_binfmt_elf.c b/fs/compat_binfmt_elf.c
+index 12b991368f0a5..2c557229696aa 100644
+--- a/fs/compat_binfmt_elf.c
++++ b/fs/compat_binfmt_elf.c
+@@ -115,11 +115,16 @@
+ #define START_THREAD		COMPAT_START_THREAD
+ #endif
+ 
+-#ifdef	compat_arch_setup_additional_pages
++#ifdef compat_arch_setup_additional_pages
++#define COMPAT_ARCH_SETUP_ADDITIONAL_PAGES(bprm, ex, interpreter) \
++	compat_arch_setup_additional_pages(bprm, interpreter)
++#endif
++
++#ifdef	COMPAT_ARCH_SETUP_ADDITIONAL_PAGES
+ #undef	ARCH_HAS_SETUP_ADDITIONAL_PAGES
+ #define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
+-#undef	arch_setup_additional_pages
+-#define	arch_setup_additional_pages compat_arch_setup_additional_pages
++#undef	ARCH_SETUP_ADDITIONAL_PAGES
++#define	ARCH_SETUP_ADDITIONAL_PAGES COMPAT_ARCH_SETUP_ADDITIONAL_PAGES
+ #endif
+ 
+ #ifdef	compat_elf_read_implies_exec
+diff --git a/include/linux/elf.h b/include/linux/elf.h
+index 6dbcfe7a3fd73..c9a46c4e183bc 100644
+--- a/include/linux/elf.h
++++ b/include/linux/elf.h
+@@ -27,6 +27,11 @@
+ 	start_thread(regs, elf_entry, start_stack)
+ #endif
+ 
++#if defined(ARCH_HAS_SETUP_ADDITIONAL_PAGES) && !defined(ARCH_SETUP_ADDITIONAL_PAGES)
++#define ARCH_SETUP_ADDITIONAL_PAGES(bprm, ex, interpreter) \
++	arch_setup_additional_pages(bprm, interpreter)
++#endif
++
+ #define ELF32_GNU_PROPERTY_ALIGN	4
+ #define ELF64_GNU_PROPERTY_ALIGN	8
+ 
+
+From b2cde8015aeb4ed2e5a505a562af0d3ee234c219 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:34 -0400
+Subject: [PATCH 11/43] x86/elf: Use e_machine to check for x32/ia32 in
+ setup_additional_pages()
+
+Since TIF_X32 is going away, avoid using it to find the ELF type when
+choosing which additional pages to set up.
+
+According to SysV AMD64 ABI Draft, an AMD64 ELF object using ILP32 must
+have ELFCLASS32 with (E_MACHINE == EM_X86_64), so use that ELF field to
+differentiate a x32 object from a IA32 object when executing
+setup_additional_pages() in compat mode.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201004032536.1229030-9-krisman@collabora.com
+---
+ arch/x86/entry/vdso/vma.c  | 4 ++--
+ arch/x86/include/asm/elf.h | 6 ++++--
+ 2 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/arch/x86/entry/vdso/vma.c b/arch/x86/entry/vdso/vma.c
+index 9185cb1d13b9b..50e5d3a2e70a4 100644
+--- a/arch/x86/entry/vdso/vma.c
++++ b/arch/x86/entry/vdso/vma.c
+@@ -413,10 +413,10 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
+ 
+ #ifdef CONFIG_COMPAT
+ int compat_arch_setup_additional_pages(struct linux_binprm *bprm,
+-				       int uses_interp)
++				       int uses_interp, bool x32)
+ {
+ #ifdef CONFIG_X86_X32_ABI
+-	if (test_thread_flag(TIF_X32)) {
++	if (x32) {
+ 		if (!vdso64_enabled)
+ 			return 0;
+ 		return map_vdso_randomized(&vdso_image_x32);
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index 109697a19eb10..44a9b99405352 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -383,8 +383,10 @@ struct linux_binprm;
+ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+ 				       int uses_interp);
+ extern int compat_arch_setup_additional_pages(struct linux_binprm *bprm,
+-					      int uses_interp);
+-#define compat_arch_setup_additional_pages compat_arch_setup_additional_pages
++					      int uses_interp, bool x32);
++#define COMPAT_ARCH_SETUP_ADDITIONAL_PAGES(bprm, ex, interpreter)	\
++	compat_arch_setup_additional_pages(bprm, interpreter,		\
++					   (ex->e_machine == EM_X86_64))
+ 
+ /* Do not change the values. See get_align_mask() */
+ enum align_flags {
+
+From 7f96acd8d816db22ad16f76552b9cfbd6b3d4f1c Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:35 -0400
+Subject: [PATCH 12/43] x86/mm: Convert mmu context ia32_compat into a proper
+ flags field
+
+The ia32_compat attribute is a weird thing.  It mirrors TIF_IA32 and
+TIF_X32 and is used only in two very unrelated places: (1) to decide if
+the vsyscall page is accessible (2) for uprobes to find whether the
+patched instruction is 32 or 64 bit.
+
+In preparation to remove the TIF flags, a new mechanism is required for
+ia32_compat, but given its odd semantics, adding a real flags field which
+configures these specific behaviours is the best option.
+
+So, set_personality_x64() can ask for the vsyscall page, which is not
+available in x32/ia32 and set_personality_ia32() can configure the uprobe
+code as needed.
+
+uprobe cannot rely on other methods like user_64bit_mode() to decide how
+to patch, so it needs some specific flag like this.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Andy Lutomirski<luto@kernel.org>
+Link: https://lore.kernel.org/r/20201004032536.1229030-10-krisman@collabora.com
+---
+ arch/x86/entry/vsyscall/vsyscall_64.c |  2 +-
+ arch/x86/include/asm/mmu.h            |  9 +++++++--
+ arch/x86/include/asm/mmu_context.h    |  2 +-
+ arch/x86/kernel/process_64.c          | 17 +++++++++++------
+ 4 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/arch/x86/entry/vsyscall/vsyscall_64.c b/arch/x86/entry/vsyscall/vsyscall_64.c
+index 44c33103a9554..1b40b92970831 100644
+--- a/arch/x86/entry/vsyscall/vsyscall_64.c
++++ b/arch/x86/entry/vsyscall/vsyscall_64.c
+@@ -316,7 +316,7 @@ static struct vm_area_struct gate_vma __ro_after_init = {
+ struct vm_area_struct *get_gate_vma(struct mm_struct *mm)
+ {
+ #ifdef CONFIG_COMPAT
+-	if (!mm || mm->context.ia32_compat)
++	if (!mm || !(mm->context.flags & MM_CONTEXT_HAS_VSYSCALL))
+ 		return NULL;
+ #endif
+ 	if (vsyscall_mode == NONE)
+diff --git a/arch/x86/include/asm/mmu.h b/arch/x86/include/asm/mmu.h
+index 9257667d13c5e..5d7494631ea95 100644
+--- a/arch/x86/include/asm/mmu.h
++++ b/arch/x86/include/asm/mmu.h
+@@ -6,6 +6,12 @@
+ #include <linux/rwsem.h>
+ #include <linux/mutex.h>
+ #include <linux/atomic.h>
++#include <linux/bits.h>
++
++/* Uprobes on this MM assume 32-bit code */
++#define MM_CONTEXT_UPROBE_IA32	BIT(0)
++/* vsyscall page is accessible on this MM */
++#define MM_CONTEXT_HAS_VSYSCALL	BIT(1)
+ 
+ /*
+  * x86 has arch-specific MMU state beyond what lives in mm_struct.
+@@ -33,8 +39,7 @@ typedef struct {
+ #endif
+ 
+ #ifdef CONFIG_X86_64
+-	/* True if mm supports a task running in 32 bit compatibility mode. */
+-	unsigned short ia32_compat;
++	unsigned short flags;
+ #endif
+ 
+ 	struct mutex lock;
+diff --git a/arch/x86/include/asm/mmu_context.h b/arch/x86/include/asm/mmu_context.h
+index d98016b837559..054a791573231 100644
+--- a/arch/x86/include/asm/mmu_context.h
++++ b/arch/x86/include/asm/mmu_context.h
+@@ -177,7 +177,7 @@ static inline void arch_exit_mmap(struct mm_struct *mm)
+ static inline bool is_64bit_mm(struct mm_struct *mm)
+ {
+ 	return	!IS_ENABLED(CONFIG_IA32_EMULATION) ||
+-		!(mm->context.ia32_compat == TIF_IA32);
++		!(mm->context.flags & MM_CONTEXT_UPROBE_IA32);
+ }
+ #else
+ static inline bool is_64bit_mm(struct mm_struct *mm)
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index 5fb4103101f51..d6efaf6623c95 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -646,10 +646,8 @@ void set_personality_64bit(void)
+ 	/* Pretend that this comes from a 64bit execve */
+ 	task_pt_regs(current)->orig_ax = __NR_execve;
+ 	current_thread_info()->status &= ~TS_COMPAT;
+-
+-	/* Ensure the corresponding mm is not marked. */
+ 	if (current->mm)
+-		current->mm->context.ia32_compat = 0;
++		current->mm->context.flags = MM_CONTEXT_HAS_VSYSCALL;
+ 
+ 	/* TBD: overwrites user setup. Should have two bits.
+ 	   But 64bit processes have always behaved this way,
+@@ -664,7 +662,8 @@ static void __set_personality_x32(void)
+ 	clear_thread_flag(TIF_IA32);
+ 	set_thread_flag(TIF_X32);
+ 	if (current->mm)
+-		current->mm->context.ia32_compat = TIF_X32;
++		current->mm->context.flags = 0;
++
+ 	current->personality &= ~READ_IMPLIES_EXEC;
+ 	/*
+ 	 * in_32bit_syscall() uses the presence of the x32 syscall bit
+@@ -684,8 +683,14 @@ static void __set_personality_ia32(void)
+ #ifdef CONFIG_IA32_EMULATION
+ 	set_thread_flag(TIF_IA32);
+ 	clear_thread_flag(TIF_X32);
+-	if (current->mm)
+-		current->mm->context.ia32_compat = TIF_IA32;
++	if (current->mm) {
++		/*
++		 * uprobes applied to this MM need to know this and
++		 * cannot use user_64bit_mode() at that time.
++		 */
++		current->mm->context.flags = MM_CONTEXT_UPROBE_IA32;
++	}
++
+ 	current->personality |= force_personality32;
+ 	/* Prepare the first "return" to user space */
+ 	task_pt_regs(current)->orig_ax = __NR_ia32_execve;
+
+From 0b95c4b6f84c4c7eb5e3f839caefe7ec8c89eb41 Mon Sep 17 00:00:00 2001
+From: Gabriel Krisman Bertazi <krisman@collabora.com>
+Date: Sat, 3 Oct 2020 23:25:36 -0400
+Subject: [PATCH 13/43] x86: Reclaim TIF_IA32 and TIF_X32
+
+Now that these flags are no longer used, reclaim those TIF bits.
+
+Signed-off-by: Gabriel Krisman Bertazi <krisman@collabora.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201004032536.1229030-11-krisman@collabora.com
+---
+ arch/x86/include/asm/thread_info.h | 4 ----
+ arch/x86/kernel/process_64.c       | 6 ------
+ 2 files changed, 10 deletions(-)
+
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index 44733a4bfc429..a12b9644193b6 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -91,7 +91,6 @@ struct thread_info {
+ #define TIF_NEED_FPU_LOAD	14	/* load FPU on return to userspace */
+ #define TIF_NOCPUID		15	/* CPUID is not accessible in userland */
+ #define TIF_NOTSC		16	/* TSC is not accessible in userland */
+-#define TIF_IA32		17	/* IA32 compatibility process */
+ #define TIF_SLD			18	/* Restore split lock detection on context switch */
+ #define TIF_MEMDIE		20	/* is terminating due to OOM killer */
+ #define TIF_POLLING_NRFLAG	21	/* idle is polling for TIF_NEED_RESCHED */
+@@ -101,7 +100,6 @@ struct thread_info {
+ #define TIF_LAZY_MMU_UPDATES	27	/* task is updating the mmu lazily */
+ #define TIF_SYSCALL_TRACEPOINT	28	/* syscall tracepoint instrumentation */
+ #define TIF_ADDR32		29	/* 32-bit address space on 64 bits */
+-#define TIF_X32			30	/* 32-bit native x86-64 binary */
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+@@ -120,7 +118,6 @@ struct thread_info {
+ #define _TIF_NEED_FPU_LOAD	(1 << TIF_NEED_FPU_LOAD)
+ #define _TIF_NOCPUID		(1 << TIF_NOCPUID)
+ #define _TIF_NOTSC		(1 << TIF_NOTSC)
+-#define _TIF_IA32		(1 << TIF_IA32)
+ #define _TIF_SLD		(1 << TIF_SLD)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_IO_BITMAP		(1 << TIF_IO_BITMAP)
+@@ -129,7 +126,6 @@ struct thread_info {
+ #define _TIF_LAZY_MMU_UPDATES	(1 << TIF_LAZY_MMU_UPDATES)
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_ADDR32		(1 << TIF_ADDR32)
+-#define _TIF_X32		(1 << TIF_X32)
+ 
+ /* flags to check in __switch_to() */
+ #define _TIF_WORK_CTXSW_BASE					\
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index d6efaf6623c95..ad582f9ac5a6f 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -640,9 +640,7 @@ void set_personality_64bit(void)
+ 	/* inherit personality from parent */
+ 
+ 	/* Make sure to be in 64bit mode */
+-	clear_thread_flag(TIF_IA32);
+ 	clear_thread_flag(TIF_ADDR32);
+-	clear_thread_flag(TIF_X32);
+ 	/* Pretend that this comes from a 64bit execve */
+ 	task_pt_regs(current)->orig_ax = __NR_execve;
+ 	current_thread_info()->status &= ~TS_COMPAT;
+@@ -659,8 +657,6 @@ void set_personality_64bit(void)
+ static void __set_personality_x32(void)
+ {
+ #ifdef CONFIG_X86_X32
+-	clear_thread_flag(TIF_IA32);
+-	set_thread_flag(TIF_X32);
+ 	if (current->mm)
+ 		current->mm->context.flags = 0;
+ 
+@@ -681,8 +677,6 @@ static void __set_personality_x32(void)
+ static void __set_personality_ia32(void)
+ {
+ #ifdef CONFIG_IA32_EMULATION
+-	set_thread_flag(TIF_IA32);
+-	clear_thread_flag(TIF_X32);
+ 	if (current->mm) {
+ 		/*
+ 		 * uprobes applied to this MM need to know this and
+
+From 8cdcd923e6f1481443e735b5ed9fe52c4acbfeea Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 26 Oct 2020 14:32:29 -0600
+Subject: [PATCH 14/43] x86: Wire up TIF_NOTIFY_SIGNAL
+
+The generic entry code has support for TIF_NOTIFY_SIGNAL already. Just
+provide the TIF bit.
+
+[ tglx: Adopted to other TIF changes in x86 ]
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20201026203230.386348-4-axboe@kernel.dk
+---
+ arch/x86/include/asm/thread_info.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/arch/x86/include/asm/thread_info.h b/arch/x86/include/asm/thread_info.h
+index a12b9644193b6..06a171037558d 100644
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -91,6 +91,7 @@ struct thread_info {
+ #define TIF_NEED_FPU_LOAD	14	/* load FPU on return to userspace */
+ #define TIF_NOCPUID		15	/* CPUID is not accessible in userland */
+ #define TIF_NOTSC		16	/* TSC is not accessible in userland */
++#define TIF_NOTIFY_SIGNAL	17	/* signal notifications exist */
+ #define TIF_SLD			18	/* Restore split lock detection on context switch */
+ #define TIF_MEMDIE		20	/* is terminating due to OOM killer */
+ #define TIF_POLLING_NRFLAG	21	/* idle is polling for TIF_NEED_RESCHED */
+@@ -118,6 +119,7 @@ struct thread_info {
+ #define _TIF_NEED_FPU_LOAD	(1 << TIF_NEED_FPU_LOAD)
+ #define _TIF_NOCPUID		(1 << TIF_NOCPUID)
+ #define _TIF_NOTSC		(1 << TIF_NOTSC)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_SLD		(1 << TIF_SLD)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_IO_BITMAP		(1 << TIF_IO_BITMAP)
+
+From 103bc4e7348aebf901b580d63df898a63bb35684 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 12 Oct 2020 07:15:37 -0600
+Subject: [PATCH 15/43] arc: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for arc.
+
+Cc: linux-snps-arc@lists.infradead.org
+Acked-by: Vineet Gupta <vgupta@synopsys.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/arc/include/asm/thread_info.h | 4 +++-
+ arch/arc/kernel/entry.S            | 3 ++-
+ arch/arc/kernel/signal.c           | 2 +-
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arc/include/asm/thread_info.h b/arch/arc/include/asm/thread_info.h
+index f9eef0e8f0b77..c0942c24d4015 100644
+--- a/arch/arc/include/asm/thread_info.h
++++ b/arch/arc/include/asm/thread_info.h
+@@ -79,6 +79,7 @@ static inline __attribute_const__ struct thread_info *current_thread_info(void)
+ #define TIF_SIGPENDING		2	/* signal pending */
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+ #define TIF_SYSCALL_AUDIT	4	/* syscall auditing active */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_SYSCALL_TRACE	15	/* syscall trace active */
+ 
+ /* true if poll_idle() is polling TIF_NEED_RESCHED */
+@@ -89,11 +90,12 @@ static inline __attribute_const__ struct thread_info *current_thread_info(void)
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+ #define _TIF_SYSCALL_AUDIT	(1<<TIF_SYSCALL_AUDIT)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_MEMDIE		(1<<TIF_MEMDIE)
+ 
+ /* work to do on interrupt/exception return */
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
+-				 _TIF_NOTIFY_RESUME)
++				 _TIF_NOTIFY_RESUME | _TIF_NOTIFY_SIGNAL)
+ 
+ /*
+  * _TIF_ALLWORK_MASK includes SYSCALL_TRACE, but we don't need it.
+diff --git a/arch/arc/kernel/entry.S b/arch/arc/kernel/entry.S
+index ea00c8a17f079..1f5308abf36d6 100644
+--- a/arch/arc/kernel/entry.S
++++ b/arch/arc/kernel/entry.S
+@@ -307,7 +307,8 @@ resume_user_mode_begin:
+ 	mov r0, sp	; pt_regs for arg to do_signal()/do_notify_resume()
+ 
+ 	GET_CURR_THR_INFO_FLAGS   r9
+-	bbit0  r9, TIF_SIGPENDING, .Lchk_notify_resume
++	and.f  0,  r9, TIF_SIGPENDING|TIF_NOTIFY_SIGNAL
++	bz .Lchk_notify_resume
+ 
+ 	; Normal Trap/IRQ entry only saves Scratch (caller-saved) regs
+ 	; in pt_reg since the "C" ABI (kernel code) will automatically
+diff --git a/arch/arc/kernel/signal.c b/arch/arc/kernel/signal.c
+index 2be55fb96d870..a78d8f745a678 100644
+--- a/arch/arc/kernel/signal.c
++++ b/arch/arc/kernel/signal.c
+@@ -362,7 +362,7 @@ void do_signal(struct pt_regs *regs)
+ 
+ 	restart_scall = in_syscall(regs) && syscall_restartable(regs);
+ 
+-	if (get_signal(&ksig)) {
++	if (test_thread_flag(TIF_SIGPENDING) && get_signal(&ksig)) {
+ 		if (restart_scall) {
+ 			arc_restart_syscall(&ksig.ka, regs);
+ 			syscall_wont_restart(regs);	/* No more restarts */
+
+From 0058af6eb34705c7c7a5398b0c50553fa46ce830 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 22 Oct 2020 20:09:23 -0600
+Subject: [PATCH 16/43] arm64: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for arm64.
+
+Cc: linux-arm-kernel@lists.infradead.org
+Acked-by: Will Deacon <will@kernel.org>
+Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/arm64/include/asm/thread_info.h | 5 ++++-
+ arch/arm64/kernel/signal.c           | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/include/asm/thread_info.h b/arch/arm64/include/asm/thread_info.h
+index 1fbab854a51b0..cdcf307764aad 100644
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -68,6 +68,7 @@ void arch_release_task_struct(struct task_struct *tsk);
+ #define TIF_UPROBE		4	/* uprobe breakpoint or singlestep */
+ #define TIF_FSCHECK		5	/* Check FS is USER_DS on return */
+ #define TIF_MTE_ASYNC_FAULT	6	/* MTE Asynchronous Tag Check Fault */
++#define TIF_NOTIFY_SIGNAL	7	/* signal notifications exist */
+ #define TIF_SYSCALL_TRACE	8	/* syscall trace active */
+ #define TIF_SYSCALL_AUDIT	9	/* syscall auditing */
+ #define TIF_SYSCALL_TRACEPOINT	10	/* syscall tracepoint for ftrace */
+@@ -98,10 +99,12 @@ void arch_release_task_struct(struct task_struct *tsk);
+ #define _TIF_32BIT		(1 << TIF_32BIT)
+ #define _TIF_SVE		(1 << TIF_SVE)
+ #define _TIF_MTE_ASYNC_FAULT	(1 << TIF_MTE_ASYNC_FAULT)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ 
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
+ 				 _TIF_NOTIFY_RESUME | _TIF_FOREIGN_FPSTATE | \
+-				 _TIF_UPROBE | _TIF_FSCHECK | _TIF_MTE_ASYNC_FAULT)
++				 _TIF_UPROBE | _TIF_FSCHECK | _TIF_MTE_ASYNC_FAULT | \
++				 _TIF_NOTIFY_SIGNAL)
+ 
+ #define _TIF_SYSCALL_WORK	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
+ 				 _TIF_SYSCALL_TRACEPOINT | _TIF_SECCOMP | \
+diff --git a/arch/arm64/kernel/signal.c b/arch/arm64/kernel/signal.c
+index a8184cad88907..bec6ef69704ff 100644
+--- a/arch/arm64/kernel/signal.c
++++ b/arch/arm64/kernel/signal.c
+@@ -942,7 +942,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 					       (void __user *)NULL, current);
+ 			}
+ 
+-			if (thread_flags & _TIF_SIGPENDING)
++			if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 				do_signal(regs);
+ 
+ 			if (thread_flags & _TIF_NOTIFY_RESUME) {
+
+From 812369ea6266abc64da65a6dc5275f2bf45ff565 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:10:55 -0600
+Subject: [PATCH 17/43] m68k: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for m68k.
+
+Cc: linux-m68k@lists.linux-m68k.org
+Acked-by: Geert Uytterhoeven <geert@linux-m68k.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/m68k/include/asm/thread_info.h | 1 +
+ arch/m68k/kernel/signal.c           | 3 ++-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/arch/m68k/include/asm/thread_info.h b/arch/m68k/include/asm/thread_info.h
+index 3689c6718c883..15a757073fa58 100644
+--- a/arch/m68k/include/asm/thread_info.h
++++ b/arch/m68k/include/asm/thread_info.h
+@@ -60,6 +60,7 @@ static inline struct thread_info *current_thread_info(void)
+  * bits 0-7 are tested at every exception exit
+  * bits 8-15 are also tested at syscall exit
+  */
++#define TIF_NOTIFY_SIGNAL	4
+ #define TIF_NOTIFY_RESUME	5	/* callback before returning to user */
+ #define TIF_SIGPENDING		6	/* signal pending */
+ #define TIF_NEED_RESCHED	7	/* rescheduling necessary */
+diff --git a/arch/m68k/kernel/signal.c b/arch/m68k/kernel/signal.c
+index 46f91e0f6a082..349570f16a786 100644
+--- a/arch/m68k/kernel/signal.c
++++ b/arch/m68k/kernel/signal.c
+@@ -1133,7 +1133,8 @@ static void do_signal(struct pt_regs *regs)
+ 
+ void do_notify_resume(struct pt_regs *regs)
+ {
+-	if (test_thread_flag(TIF_SIGPENDING))
++	if (test_thread_flag(TIF_NOTIFY_SIGNAL) ||
++	    test_thread_flag(TIF_SIGPENDING))
+ 		do_signal(regs);
+ 
+ 	if (test_thread_flag(TIF_NOTIFY_RESUME))
+
+From 8d65d3037a63f89d6468e25b76c4348092d985ab Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:21:21 -0600
+Subject: [PATCH 18/43] nios32: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for nios32.
+
+Cc: Ley Foon Tan <ley.foon.tan@intel.com>
+Acked-by: Ley Foon Tan <ley.foon.tan@intel.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/nios2/include/asm/thread_info.h | 2 ++
+ arch/nios2/kernel/signal.c           | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/arch/nios2/include/asm/thread_info.h b/arch/nios2/include/asm/thread_info.h
+index 7349a4fa635be..272d2c72a7275 100644
+--- a/arch/nios2/include/asm/thread_info.h
++++ b/arch/nios2/include/asm/thread_info.h
+@@ -86,6 +86,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_MEMDIE		4	/* is terminating due to OOM killer */
+ #define TIF_SECCOMP		5	/* secure computing */
+ #define TIF_SYSCALL_AUDIT	6	/* syscall auditing active */
++#define TIF_NOTIFY_SIGNAL	7	/* signal notifications exist */
+ #define TIF_RESTORE_SIGMASK	9	/* restore signal mask in do_signal() */
+ 
+ #define TIF_POLLING_NRFLAG	16	/* true if poll_idle() is polling
+@@ -97,6 +98,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_RESTORE_SIGMASK	(1 << TIF_RESTORE_SIGMASK)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ 
+diff --git a/arch/nios2/kernel/signal.c b/arch/nios2/kernel/signal.c
+index cf2dca2ac7c37..2009ae2d3c3bb 100644
+--- a/arch/nios2/kernel/signal.c
++++ b/arch/nios2/kernel/signal.c
+@@ -306,7 +306,8 @@ asmlinkage int do_notify_resume(struct pt_regs *regs)
+ 	if (!user_mode(regs))
+ 		return 0;
+ 
+-	if (test_thread_flag(TIF_SIGPENDING)) {
++	if (test_thread_flag(TIF_SIGPENDING) ||
++	    test_thread_flag(TIF_NOTIFY_SIGNAL)) {
+ 		int restart = do_signal(regs);
+ 
+ 		if (unlikely(restart)) {
+
+From 830d3a6de3c68811f6dfb51d023ce139a7abc251 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:27:02 -0600
+Subject: [PATCH 19/43] parisc: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for parisc.
+
+Cc: linux-parisc@vger.kernel.org
+Acked-by: Helge Deller <deller@gmx.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/parisc/include/asm/thread_info.h | 4 +++-
+ arch/parisc/kernel/signal.c           | 3 ++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/parisc/include/asm/thread_info.h b/arch/parisc/include/asm/thread_info.h
+index 285757544cca2..0bd38a972ceab 100644
+--- a/arch/parisc/include/asm/thread_info.h
++++ b/arch/parisc/include/asm/thread_info.h
+@@ -52,6 +52,7 @@ struct thread_info {
+ #define TIF_POLLING_NRFLAG	3	/* true if poll_idle() is polling TIF_NEED_RESCHED */
+ #define TIF_32BIT               4       /* 32 bit binary */
+ #define TIF_MEMDIE		5	/* is terminating due to OOM killer */
++#define TIF_NOTIFY_SIGNAL	6	/* signal notifications exist */
+ #define TIF_SYSCALL_AUDIT	7	/* syscall auditing active */
+ #define TIF_NOTIFY_RESUME	8	/* callback before returning to user */
+ #define TIF_SINGLESTEP		9	/* single stepping? */
+@@ -61,6 +62,7 @@ struct thread_info {
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_32BIT		(1 << TIF_32BIT)
+@@ -72,7 +74,7 @@ struct thread_info {
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ 
+ #define _TIF_USER_WORK_MASK     (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | \
+-                                 _TIF_NEED_RESCHED)
++                                 _TIF_NEED_RESCHED | _TIF_NOTIFY_SIGNAL)
+ #define _TIF_SYSCALL_TRACE_MASK (_TIF_SYSCALL_TRACE | _TIF_SINGLESTEP |	\
+ 				 _TIF_BLOCKSTEP | _TIF_SYSCALL_AUDIT | \
+ 				 _TIF_SECCOMP | _TIF_SYSCALL_TRACEPOINT)
+diff --git a/arch/parisc/kernel/signal.c b/arch/parisc/kernel/signal.c
+index 9f43eaeb0b0af..fb1e94a3982bc 100644
+--- a/arch/parisc/kernel/signal.c
++++ b/arch/parisc/kernel/signal.c
+@@ -603,7 +603,8 @@ do_signal(struct pt_regs *regs, long in_syscall)
+ 
+ void do_notify_resume(struct pt_regs *regs, long in_syscall)
+ {
+-	if (test_thread_flag(TIF_SIGPENDING))
++	if (test_thread_flag(TIF_SIGPENDING) ||
++	    test_thread_flag(TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs, in_syscall);
+ 
+ 	if (test_thread_flag(TIF_NOTIFY_RESUME))
+
+From 45b0633b4618f5d7e1ffb339e287a2e7b354332d Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 22 Oct 2020 20:11:56 -0600
+Subject: [PATCH 20/43] powerpc: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for powerpc.
+
+Cc: linuxppc-dev@lists.ozlabs.org
+Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/powerpc/include/asm/thread_info.h | 5 ++++-
+ arch/powerpc/kernel/signal.c           | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/thread_info.h b/arch/powerpc/include/asm/thread_info.h
+index 46a210b03d2b8..53115ae614955 100644
+--- a/arch/powerpc/include/asm/thread_info.h
++++ b/arch/powerpc/include/asm/thread_info.h
+@@ -90,6 +90,7 @@ void arch_setup_new_exec(void);
+ #define TIF_SYSCALL_TRACE	0	/* syscall trace active */
+ #define TIF_SIGPENDING		1	/* signal pending */
+ #define TIF_NEED_RESCHED	2	/* rescheduling necessary */
++#define TIF_NOTIFY_SIGNAL	3	/* signal notifications exist */
+ #define TIF_SYSCALL_EMU		4	/* syscall emulation active */
+ #define TIF_RESTORE_TM		5	/* need to restore TM FP/VEC/VSX */
+ #define TIF_PATCH_PENDING	6	/* pending live patching update */
+@@ -115,6 +116,7 @@ void arch_setup_new_exec(void);
+ #define _TIF_SYSCALL_TRACE	(1<<TIF_SYSCALL_TRACE)
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
+ #define _TIF_32BIT		(1<<TIF_32BIT)
+ #define _TIF_RESTORE_TM		(1<<TIF_RESTORE_TM)
+@@ -136,7 +138,8 @@ void arch_setup_new_exec(void);
+ 
+ #define _TIF_USER_WORK_MASK	(_TIF_SIGPENDING | _TIF_NEED_RESCHED | \
+ 				 _TIF_NOTIFY_RESUME | _TIF_UPROBE | \
+-				 _TIF_RESTORE_TM | _TIF_PATCH_PENDING)
++				 _TIF_RESTORE_TM | _TIF_PATCH_PENDING | \
++				 _TIF_NOTIFY_SIGNAL)
+ #define _TIF_PERSYSCALL_MASK	(_TIF_RESTOREALL|_TIF_NOERROR)
+ 
+ /* Bits in local_flags */
+diff --git a/arch/powerpc/kernel/signal.c b/arch/powerpc/kernel/signal.c
+index d2c356f370775..a8bb0aca1d021 100644
+--- a/arch/powerpc/kernel/signal.c
++++ b/arch/powerpc/kernel/signal.c
+@@ -318,7 +318,7 @@ void do_notify_resume(struct pt_regs *regs, unsigned long thread_info_flags)
+ 	if (thread_info_flags & _TIF_PATCH_PENDING)
+ 		klp_update_patch_state(current);
+ 
+-	if (thread_info_flags & _TIF_SIGPENDING) {
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) {
+ 		BUG_ON(regs != current->thread.regs);
+ 		do_signal(current);
+ 	}
+
+From 9f30164e510407b74dcfc01d5f1c813753976c0f Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:16:02 -0600
+Subject: [PATCH 21/43] mips: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for mips.
+
+Cc: linux-mips@vger.kernel.org
+Acked-By: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/mips/include/asm/thread_info.h | 4 +++-
+ arch/mips/kernel/signal.c           | 2 +-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/include/asm/thread_info.h b/arch/mips/include/asm/thread_info.h
+index ee26f9a4575df..e2c352da3877a 100644
+--- a/arch/mips/include/asm/thread_info.h
++++ b/arch/mips/include/asm/thread_info.h
+@@ -115,6 +115,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_SECCOMP		4	/* secure computing */
+ #define TIF_NOTIFY_RESUME	5	/* callback before returning to user */
+ #define TIF_UPROBE		6	/* breakpointed or singlestepping */
++#define TIF_NOTIFY_SIGNAL	7	/* signal notifications exist */
+ #define TIF_RESTORE_SIGMASK	9	/* restore signal mask in do_signal() */
+ #define TIF_USEDFPU		16	/* FPU was used by this task this quantum (SMP) */
+ #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
+@@ -139,6 +140,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_SECCOMP		(1<<TIF_SECCOMP)
+ #define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
+ #define _TIF_UPROBE		(1<<TIF_UPROBE)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_USEDFPU		(1<<TIF_USEDFPU)
+ #define _TIF_NOHZ		(1<<TIF_NOHZ)
+ #define _TIF_FIXADE		(1<<TIF_FIXADE)
+@@ -164,7 +166,7 @@ static inline struct thread_info *current_thread_info(void)
+ /* work to do on interrupt/exception return */
+ #define _TIF_WORK_MASK		\
+ 	(_TIF_SIGPENDING | _TIF_NEED_RESCHED | _TIF_NOTIFY_RESUME |	\
+-	 _TIF_UPROBE)
++	 _TIF_UPROBE | _TIF_NOTIFY_SIGNAL)
+ /* work to do on any return to u-space */
+ #define _TIF_ALLWORK_MASK	(_TIF_NOHZ | _TIF_WORK_MASK |		\
+ 				 _TIF_WORK_SYSCALL_EXIT |		\
+diff --git a/arch/mips/kernel/signal.c b/arch/mips/kernel/signal.c
+index 50d0515bea21f..f1e985109da01 100644
+--- a/arch/mips/kernel/signal.c
++++ b/arch/mips/kernel/signal.c
+@@ -903,7 +903,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs, void *unused,
+ 		uprobe_notify_resume(regs);
+ 
+ 	/* deal with pending signal delivery */
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME) {
+
+From f553dc524a42bb4bbfbd369594b6f64dafe7156b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:34:12 -0600
+Subject: [PATCH 22/43] s390: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for s390.
+
+Cc: linux-s390@vger.kernel.org
+Acked-by: Heiko Carstens <hca@linux.ibm.com>
+Acked-by: Sven Schnelle <svens@linux.ibm.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/s390/include/asm/thread_info.h |  2 ++
+ arch/s390/kernel/entry.S            | 11 ++++++-----
+ arch/s390/kernel/signal.c           |  2 +-
+ 3 files changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/arch/s390/include/asm/thread_info.h b/arch/s390/include/asm/thread_info.h
+index 13a04fcf77625..0045341ade486 100644
+--- a/arch/s390/include/asm/thread_info.h
++++ b/arch/s390/include/asm/thread_info.h
+@@ -65,6 +65,7 @@ void arch_setup_new_exec(void);
+ #define TIF_GUARDED_STORAGE	4	/* load guarded storage control block */
+ #define TIF_PATCH_PENDING	5	/* pending live patching update */
+ #define TIF_PGSTE		6	/* New mm's will use 4K page tables */
++#define TIF_NOTIFY_SIGNAL	7	/* signal notifications exist */
+ #define TIF_ISOLATE_BP		8	/* Run process with isolated BP */
+ #define TIF_ISOLATE_BP_GUEST	9	/* Run KVM guests with isolated BP */
+ 
+@@ -82,6 +83,7 @@ void arch_setup_new_exec(void);
+ #define TIF_SYSCALL_TRACEPOINT	27	/* syscall tracepoint instrumentation */
+ 
+ #define _TIF_NOTIFY_RESUME	BIT(TIF_NOTIFY_RESUME)
++#define _TIF_NOTIFY_SIGNAL	BIT(TIF_NOTIFY_SIGNAL)
+ #define _TIF_SIGPENDING		BIT(TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	BIT(TIF_NEED_RESCHED)
+ #define _TIF_UPROBE		BIT(TIF_UPROBE)
+diff --git a/arch/s390/kernel/entry.S b/arch/s390/kernel/entry.S
+index 92beb14446449..285be018f4c11 100644
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@ -52,7 +52,8 @@ STACK_SIZE  = 1 << STACK_SHIFT
+ STACK_INIT = STACK_SIZE - STACK_FRAME_OVERHEAD - __PT_SIZE
+ 
+ _TIF_WORK	= (_TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NEED_RESCHED | \
+-		   _TIF_UPROBE | _TIF_GUARDED_STORAGE | _TIF_PATCH_PENDING)
++		   _TIF_UPROBE | _TIF_GUARDED_STORAGE | _TIF_PATCH_PENDING | \
++		   _TIF_NOTIFY_SIGNAL)
+ _TIF_TRACE	= (_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | _TIF_SECCOMP | \
+ 		   _TIF_SYSCALL_TRACEPOINT)
+ _CIF_WORK	= (_CIF_ASCE_PRIMARY | _CIF_ASCE_SECONDARY | _CIF_FPU)
+@@ -465,8 +466,8 @@ ENTRY(system_call)
+ #endif
+ 	TSTMSK	__PT_FLAGS(%r11),_PIF_SYSCALL_RESTART
+ 	jo	.Lsysc_syscall_restart
+-	TSTMSK	__TI_flags(%r12),_TIF_SIGPENDING
+-	jo	.Lsysc_sigpending
++	TSTMSK	__TI_flags(%r12),(_TIF_SIGPENDING|_TIF_NOTIFY_SIGNAL)
++	jnz	.Lsysc_sigpending
+ 	TSTMSK	__TI_flags(%r12),_TIF_NOTIFY_RESUME
+ 	jo	.Lsysc_notify_resume
+ 	TSTMSK	__LC_CPU_FLAGS,(_CIF_ASCE_PRIMARY|_CIF_ASCE_SECONDARY)
+@@ -847,8 +848,8 @@ ENTRY(io_int_handler)
+ 	TSTMSK	__TI_flags(%r12),_TIF_PATCH_PENDING
+ 	jo	.Lio_patch_pending
+ #endif
+-	TSTMSK	__TI_flags(%r12),_TIF_SIGPENDING
+-	jo	.Lio_sigpending
++	TSTMSK	__TI_flags(%r12),(_TIF_SIGPENDING|_TIF_NOTIFY_SIGNAL)
++	jnz	.Lio_sigpending
+ 	TSTMSK	__TI_flags(%r12),_TIF_NOTIFY_RESUME
+ 	jo	.Lio_notify_resume
+ 	TSTMSK	__TI_flags(%r12),_TIF_GUARDED_STORAGE
+diff --git a/arch/s390/kernel/signal.c b/arch/s390/kernel/signal.c
+index 9e900a8977bd2..b27b6c1f058d0 100644
+--- a/arch/s390/kernel/signal.c
++++ b/arch/s390/kernel/signal.c
+@@ -472,7 +472,7 @@ void do_signal(struct pt_regs *regs)
+ 	current->thread.system_call =
+ 		test_pt_regs_flag(regs, PIF_SYSCALL) ? regs->int_code : 0;
+ 
+-	if (get_signal(&ksig)) {
++	if (test_thread_flag(TIF_SIGPENDING) && get_signal(&ksig)) {
+ 		/* Whee!  Actually deliver the signal.  */
+ 		if (current->thread.system_call) {
+ 			regs->int_code = current->thread.system_call;
+
+From 7690459f7d1954b6bb2e586995aac833a7196437 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:47:28 -0600
+Subject: [PATCH 23/43] um: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for um.
+
+Cc: linux-um@lists.infradead.org
+Acked-By: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/um/include/asm/thread_info.h | 2 ++
+ arch/um/kernel/process.c          | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/arch/um/include/asm/thread_info.h b/arch/um/include/asm/thread_info.h
+index 4c19ce4c49f18..3b1cb8b3b1864 100644
+--- a/arch/um/include/asm/thread_info.h
++++ b/arch/um/include/asm/thread_info.h
+@@ -57,6 +57,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_SYSCALL_TRACE	0	/* syscall trace active */
+ #define TIF_SIGPENDING		1	/* signal pending */
+ #define TIF_NEED_RESCHED	2	/* rescheduling necessary */
++#define TIF_NOTIFY_SIGNAL	3	/* signal notifications exist */
+ #define TIF_RESTART_BLOCK	4
+ #define TIF_MEMDIE		5	/* is terminating due to OOM killer */
+ #define TIF_SYSCALL_AUDIT	6
+@@ -67,6 +68,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_MEMDIE		(1 << TIF_MEMDIE)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+diff --git a/arch/um/kernel/process.c b/arch/um/kernel/process.c
+index 9505a7e87396a..0fcdc374a9a1a 100644
+--- a/arch/um/kernel/process.c
++++ b/arch/um/kernel/process.c
+@@ -99,7 +99,8 @@ void interrupt_end(void)
+ 
+ 	if (need_resched())
+ 		schedule();
+-	if (test_thread_flag(TIF_SIGPENDING))
++	if (test_thread_flag(TIF_SIGPENDING) ||
++	    test_thread_flag(TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 	if (test_thread_flag(TIF_NOTIFY_RESUME))
+ 		tracehook_notify_resume(regs);
+
+From 3f69f275d79f4ac9203867342a00e17cf0f5d5a1 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:36:35 -0600
+Subject: [PATCH 24/43] sh: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for sh.
+
+Cc: linux-sh@vger.kernel.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/sh/include/asm/thread_info.h | 4 +++-
+ arch/sh/kernel/signal_32.c        | 2 +-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/arch/sh/include/asm/thread_info.h b/arch/sh/include/asm/thread_info.h
+index 243ea5150aa00..598d0184ffeae 100644
+--- a/arch/sh/include/asm/thread_info.h
++++ b/arch/sh/include/asm/thread_info.h
+@@ -105,6 +105,7 @@ extern void init_thread_xstate(void);
+ #define TIF_SYSCALL_TRACE	0	/* syscall trace active */
+ #define TIF_SIGPENDING		1	/* signal pending */
+ #define TIF_NEED_RESCHED	2	/* rescheduling necessary */
++#define TIF_NOTIFY_SIGNAL	3	/* signal notifications exist */
+ #define TIF_SINGLESTEP		4	/* singlestepping active */
+ #define TIF_SYSCALL_AUDIT	5	/* syscall auditing active */
+ #define TIF_SECCOMP		6	/* secure computing */
+@@ -116,6 +117,7 @@ extern void init_thread_xstate(void);
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+@@ -132,7 +134,7 @@ extern void init_thread_xstate(void);
+ #define _TIF_ALLWORK_MASK	(_TIF_SYSCALL_TRACE | _TIF_SIGPENDING      | \
+ 				 _TIF_NEED_RESCHED  | _TIF_SYSCALL_AUDIT   | \
+ 				 _TIF_SINGLESTEP    | _TIF_NOTIFY_RESUME   | \
+-				 _TIF_SYSCALL_TRACEPOINT)
++				 _TIF_SYSCALL_TRACEPOINT | _TIF_NOTIFY_SIGNAL)
+ 
+ /* work to do on interrupt/exception return */
+ #define _TIF_WORK_MASK		(_TIF_ALLWORK_MASK & ~(_TIF_SYSCALL_TRACE | \
+diff --git a/arch/sh/kernel/signal_32.c b/arch/sh/kernel/signal_32.c
+index 1add47fd31f62..dd3092911efad 100644
+--- a/arch/sh/kernel/signal_32.c
++++ b/arch/sh/kernel/signal_32.c
+@@ -499,7 +499,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs, unsigned int save_r0,
+ 				 unsigned long thread_info_flags)
+ {
+ 	/* deal with pending signal delivery */
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs, save_r0);
+ 
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME)
+
+From 09ee8bcca3d3055c2903a4b8cac1275a3a379ae6 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:24:46 -0600
+Subject: [PATCH 25/43] openrisc: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for openrisc.
+
+Cc: openrisc@lists.librecores.org
+Acked-by: Stafford Horne <shorne@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/openrisc/include/asm/thread_info.h | 2 ++
+ arch/openrisc/kernel/signal.c           | 2 +-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/arch/openrisc/include/asm/thread_info.h b/arch/openrisc/include/asm/thread_info.h
+index 9afe68bc423b3..4f9d2a2614558 100644
+--- a/arch/openrisc/include/asm/thread_info.h
++++ b/arch/openrisc/include/asm/thread_info.h
+@@ -98,6 +98,7 @@ register struct thread_info *current_thread_info_reg asm("r10");
+ #define TIF_SINGLESTEP		4	/* restore singlestep on return to user
+ 					 * mode
+ 					 */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_SYSCALL_TRACEPOINT  8       /* for ftrace syscall instrumentation */
+ #define TIF_RESTORE_SIGMASK     9
+ #define TIF_POLLING_NRFLAG	16	/* true if poll_idle() is polling						 * TIF_NEED_RESCHED
+@@ -109,6 +110,7 @@ register struct thread_info *current_thread_info_reg asm("r10");
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+ #define _TIF_SINGLESTEP		(1<<TIF_SINGLESTEP)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
+ 
+ 
+diff --git a/arch/openrisc/kernel/signal.c b/arch/openrisc/kernel/signal.c
+index af66f968dd459..1ebcff2710965 100644
+--- a/arch/openrisc/kernel/signal.c
++++ b/arch/openrisc/kernel/signal.c
+@@ -299,7 +299,7 @@ do_work_pending(struct pt_regs *regs, unsigned int thread_flags, int syscall)
+ 			if (unlikely(!user_mode(regs)))
+ 				return 0;
+ 			local_irq_enable();
+-			if (thread_flags & _TIF_SIGPENDING) {
++			if (thread_flags & (_TIF_SIGPENDING|_TIF_NOTIFY_SIGNAL)) {
+ 				int restart = do_signal(regs, syscall);
+ 				if (unlikely(restart)) {
+ 					/*
+
+From c45cf6599787d086ff4fe2ccd8419c90b713c522 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 14:39:00 -0600
+Subject: [PATCH 26/43] csky: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for csky.
+
+Cc: linux-csky@vger.kernel.org
+Acked-by: Guo Ren <guoren@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/csky/include/asm/thread_info.h | 5 ++++-
+ arch/csky/kernel/signal.c           | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/csky/include/asm/thread_info.h b/arch/csky/include/asm/thread_info.h
+index 68e7a1227170c..21456a3737c2a 100644
+--- a/arch/csky/include/asm/thread_info.h
++++ b/arch/csky/include/asm/thread_info.h
+@@ -64,6 +64,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_SYSCALL_TRACE	4	/* syscall trace active */
+ #define TIF_SYSCALL_TRACEPOINT	5       /* syscall tracepoint instrumentation */
+ #define TIF_SYSCALL_AUDIT	6	/* syscall auditing */
++#define TIF_NOTIFY_SIGNAL	7	/* signal notifications exist */
+ #define TIF_POLLING_NRFLAG	16	/* poll_idle() is TIF_NEED_RESCHED */
+ #define TIF_MEMDIE		18      /* is terminating due to OOM killer */
+ #define TIF_RESTORE_SIGMASK	20	/* restore signal mask in do_signal() */
+@@ -75,6 +76,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_UPROBE		(1 << TIF_UPROBE)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_MEMDIE		(1 << TIF_MEMDIE)
+@@ -82,7 +84,8 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+ 
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
+-				 _TIF_NOTIFY_RESUME | _TIF_UPROBE)
++				 _TIF_NOTIFY_RESUME | _TIF_UPROBE | \
++				 _TIF_NOTIFY_SIGNAL)
+ 
+ #define _TIF_SYSCALL_WORK	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_AUDIT | \
+ 				 _TIF_SYSCALL_TRACEPOINT | _TIF_SECCOMP)
+diff --git a/arch/csky/kernel/signal.c b/arch/csky/kernel/signal.c
+index 8b068cf374478..37ea64ed3c12b 100644
+--- a/arch/csky/kernel/signal.c
++++ b/arch/csky/kernel/signal.c
+@@ -257,7 +257,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs,
+ 		uprobe_notify_resume(regs);
+ 
+ 	/* Handle pending signal delivery */
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME) {
+
+From ecd64faed706be41fb75d498e120da0828dc6f68 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 14:45:22 -0600
+Subject: [PATCH 27/43] hexagon: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for hexagon.
+
+Cc: linux-hexagon@vger.kernel.org
+Acked-by: Brian Cain <bcain@codeaurora.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/hexagon/include/asm/thread_info.h | 2 ++
+ arch/hexagon/kernel/process.c          | 2 +-
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/arch/hexagon/include/asm/thread_info.h b/arch/hexagon/include/asm/thread_info.h
+index 563da19864645..535976665bf00 100644
+--- a/arch/hexagon/include/asm/thread_info.h
++++ b/arch/hexagon/include/asm/thread_info.h
+@@ -95,6 +95,7 @@ register struct thread_info *__current_thread_info asm(QUOTED_THREADINFO_REG);
+ #define TIF_NEED_RESCHED        3       /* rescheduling necessary */
+ #define TIF_SINGLESTEP          4       /* restore ss @ return to usr mode */
+ #define TIF_RESTORE_SIGMASK     6       /* restore sig mask in do_signal() */
++#define TIF_NOTIFY_SIGNAL	7       /* signal notifications exist */
+ /* true if poll_idle() is polling TIF_NEED_RESCHED */
+ #define TIF_MEMDIE              17      /* OOM killer killed process */
+ 
+@@ -103,6 +104,7 @@ register struct thread_info *__current_thread_info asm(QUOTED_THREADINFO_REG);
+ #define _TIF_SIGPENDING         (1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED       (1 << TIF_NEED_RESCHED)
+ #define _TIF_SINGLESTEP         (1 << TIF_SINGLESTEP)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ 
+ /* work to do on interrupt/exception return - All but TIF_SYSCALL_TRACE */
+ #define _TIF_WORK_MASK          (0x0000FFFF & ~_TIF_SYSCALL_TRACE)
+diff --git a/arch/hexagon/kernel/process.c b/arch/hexagon/kernel/process.c
+index 67767c5ed98c3..6a980cba7b294 100644
+--- a/arch/hexagon/kernel/process.c
++++ b/arch/hexagon/kernel/process.c
+@@ -174,7 +174,7 @@ int do_work_pending(struct pt_regs *regs, u32 thread_info_flags)
+ 		return 1;
+ 	}
+ 
+-	if (thread_info_flags & _TIF_SIGPENDING) {
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) {
+ 		do_signal(regs);
+ 		return 1;
+ 	}
+
+From 0109593ea326fd3c556dcd6d3e8784553406783e Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:13:57 -0600
+Subject: [PATCH 28/43] microblaze: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for microblaze.
+
+Acked-by: Michal Simek <michal.simek@xilinx.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/microblaze/include/asm/thread_info.h | 2 ++
+ arch/microblaze/kernel/signal.c           | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/arch/microblaze/include/asm/thread_info.h b/arch/microblaze/include/asm/thread_info.h
+index ad8e8fcb90d3b..44f5ca3318625 100644
+--- a/arch/microblaze/include/asm/thread_info.h
++++ b/arch/microblaze/include/asm/thread_info.h
+@@ -107,6 +107,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_NEED_RESCHED	3 /* rescheduling necessary */
+ /* restore singlestep on return to user mode */
+ #define TIF_SINGLESTEP		4
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_MEMDIE		6	/* is terminating due to OOM killer */
+ #define TIF_SYSCALL_AUDIT	9       /* syscall auditing active */
+ #define TIF_SECCOMP		10      /* secure computing */
+@@ -119,6 +120,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
+diff --git a/arch/microblaze/kernel/signal.c b/arch/microblaze/kernel/signal.c
+index f11a0ccccabc4..5a8d173d7b75c 100644
+--- a/arch/microblaze/kernel/signal.c
++++ b/arch/microblaze/kernel/signal.c
+@@ -313,7 +313,8 @@ static void do_signal(struct pt_regs *regs, int in_syscall)
+ 
+ asmlinkage void do_notify_resume(struct pt_regs *regs, int in_syscall)
+ {
+-	if (test_thread_flag(TIF_SIGPENDING))
++	if (test_thread_flag(TIF_SIGPENDING) ||
++	    test_thread_flag(TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs, in_syscall);
+ 
+ 	if (test_thread_flag(TIF_NOTIFY_RESUME))
+
+From 6bda47a34ff9abc67c4a9aa5e69f38117f771d8f Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 16:00:49 -0600
+Subject: [PATCH 29/43] arm: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for arm.
+
+Cc: linux-arm-kernel@lists.infradead.org
+Acked-by: Russell King <rmk+kernel@armlinux.org.uk>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/arm/include/asm/thread_info.h | 7 ++++++-
+ arch/arm/kernel/entry-common.S     | 6 +++---
+ arch/arm/kernel/entry-v7m.S        | 2 +-
+ arch/arm/kernel/signal.c           | 2 +-
+ 4 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/arch/arm/include/asm/thread_info.h b/arch/arm/include/asm/thread_info.h
+index 536b6b979f634..eb7ce2747eb00 100644
+--- a/arch/arm/include/asm/thread_info.h
++++ b/arch/arm/include/asm/thread_info.h
+@@ -126,6 +126,8 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+  * thread information flags:
+  *  TIF_USEDFPU		- FPU was used by this task this quantum (SMP)
+  *  TIF_POLLING_NRFLAG	- true if poll_idle() is polling TIF_NEED_RESCHED
++ *
++ * Any bit in the range of 0..15 will cause do_work_pending() to be invoked.
+  */
+ #define TIF_SIGPENDING		0	/* signal pending */
+ #define TIF_NEED_RESCHED	1	/* rescheduling necessary */
+@@ -135,6 +137,7 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ #define TIF_SYSCALL_AUDIT	5	/* syscall auditing active */
+ #define TIF_SYSCALL_TRACEPOINT	6	/* syscall tracepoint instrumentation */
+ #define TIF_SECCOMP		7	/* seccomp syscall filtering active */
++#define TIF_NOTIFY_SIGNAL	8	/* signal notifications exist */
+ 
+ #define TIF_USING_IWMMXT	17
+ #define TIF_MEMDIE		18	/* is terminating due to OOM killer */
+@@ -148,6 +151,7 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_USING_IWMMXT	(1 << TIF_USING_IWMMXT)
+ 
+ /* Checks for any syscall work in entry-common.S */
+@@ -158,7 +162,8 @@ extern int vfp_restore_user_hwstate(struct user_vfp *,
+  * Change these and you break ASM code in entry-common.S
+  */
+ #define _TIF_WORK_MASK		(_TIF_NEED_RESCHED | _TIF_SIGPENDING | \
+-				 _TIF_NOTIFY_RESUME | _TIF_UPROBE)
++				 _TIF_NOTIFY_RESUME | _TIF_UPROBE | \
++				 _TIF_NOTIFY_SIGNAL)
+ 
+ #endif /* __KERNEL__ */
+ #endif /* __ASM_ARM_THREAD_INFO_H */
+diff --git a/arch/arm/kernel/entry-common.S b/arch/arm/kernel/entry-common.S
+index 271cb8a1eba1e..77d16390a5245 100644
+--- a/arch/arm/kernel/entry-common.S
++++ b/arch/arm/kernel/entry-common.S
+@@ -53,7 +53,7 @@ __ret_fast_syscall:
+ 	cmp	r2, #TASK_SIZE
+ 	blne	addr_limit_check_failed
+ 	ldr	r1, [tsk, #TI_FLAGS]		@ re-check for syscall tracing
+-	tst	r1, #_TIF_SYSCALL_WORK | _TIF_WORK_MASK
++	movs	r1, r1, lsl #16
+ 	bne	fast_work_pending
+ 
+ 
+@@ -90,7 +90,7 @@ __ret_fast_syscall:
+ 	cmp	r2, #TASK_SIZE
+ 	blne	addr_limit_check_failed
+ 	ldr	r1, [tsk, #TI_FLAGS]		@ re-check for syscall tracing
+-	tst	r1, #_TIF_SYSCALL_WORK | _TIF_WORK_MASK
++	movs	r1, r1, lsl #16
+ 	beq	no_work_pending
+  UNWIND(.fnend		)
+ ENDPROC(ret_fast_syscall)
+@@ -131,7 +131,7 @@ ENTRY(ret_to_user_from_irq)
+ 	cmp	r2, #TASK_SIZE
+ 	blne	addr_limit_check_failed
+ 	ldr	r1, [tsk, #TI_FLAGS]
+-	tst	r1, #_TIF_WORK_MASK
++	movs	r1, r1, lsl #16
+ 	bne	slow_work_pending
+ no_work_pending:
+ 	asm_trace_hardirqs_on save = 0
+diff --git a/arch/arm/kernel/entry-v7m.S b/arch/arm/kernel/entry-v7m.S
+index de1f20624be15..d0e898608d303 100644
+--- a/arch/arm/kernel/entry-v7m.S
++++ b/arch/arm/kernel/entry-v7m.S
+@@ -59,7 +59,7 @@ __irq_entry:
+ 
+ 	get_thread_info tsk
+ 	ldr	r2, [tsk, #TI_FLAGS]
+-	tst	r2, #_TIF_WORK_MASK
++	movs	r2, r2, lsl #16
+ 	beq	2f			@ no work pending
+ 	mov	r0, #V7M_SCB_ICSR_PENDSVSET
+ 	str	r0, [r1, V7M_SCB_ICSR]	@ raise PendSV
+diff --git a/arch/arm/kernel/signal.c b/arch/arm/kernel/signal.c
+index 585edbfccf6df..9d2e916121be4 100644
+--- a/arch/arm/kernel/signal.c
++++ b/arch/arm/kernel/signal.c
+@@ -655,7 +655,7 @@ do_work_pending(struct pt_regs *regs, unsigned int thread_flags, int syscall)
+ 			if (unlikely(!user_mode(regs)))
+ 				return 0;
+ 			local_irq_enable();
+-			if (thread_flags & _TIF_SIGPENDING) {
++			if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)) {
+ 				int restart = do_signal(regs, syscall);
+ 				if (unlikely(restart)) {
+ 					/*
+
+From 9ef93434f58905acc531667d3739ae5e0ef48015 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:56:07 -0600
+Subject: [PATCH 30/43] xtensa: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for xtensa.
+
+Thanks to Max Filippov <jcmvbkbc@gmail.com> for making the asm correct.
+
+Cc: linux-xtensa@linux-xtensa.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/xtensa/include/asm/thread_info.h | 5 ++++-
+ arch/xtensa/kernel/entry.S            | 4 ++--
+ arch/xtensa/kernel/signal.c           | 3 ++-
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/arch/xtensa/include/asm/thread_info.h b/arch/xtensa/include/asm/thread_info.h
+index 6acbbe0d87d3d..a312333a9addc 100644
+--- a/arch/xtensa/include/asm/thread_info.h
++++ b/arch/xtensa/include/asm/thread_info.h
+@@ -111,18 +111,21 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_NEED_RESCHED	2	/* rescheduling necessary */
+ #define TIF_SINGLESTEP		3	/* restore singlestep on return to user mode */
+ #define TIF_SYSCALL_TRACEPOINT	4	/* syscall tracepoint instrumentation */
+-#define TIF_MEMDIE		5	/* is terminating due to OOM killer */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_RESTORE_SIGMASK	6	/* restore signal mask in do_signal() */
+ #define TIF_NOTIFY_RESUME	7	/* callback before returning to user */
+ #define TIF_DB_DISABLED		8	/* debug trap disabled for syscall */
+ #define TIF_SYSCALL_AUDIT	9	/* syscall auditing active */
+ #define TIF_SECCOMP		10	/* secure computing */
++#define TIF_MEMDIE		11	/* is terminating due to OOM killer */
+ 
+ #define _TIF_SYSCALL_TRACE	(1<<TIF_SYSCALL_TRACE)
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+ #define _TIF_SINGLESTEP		(1<<TIF_SINGLESTEP)
+ #define _TIF_SYSCALL_TRACEPOINT	(1<<TIF_SYSCALL_TRACEPOINT)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
++#define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
+ #define _TIF_SYSCALL_AUDIT	(1<<TIF_SYSCALL_AUDIT)
+ #define _TIF_SECCOMP		(1<<TIF_SECCOMP)
+ 
+diff --git a/arch/xtensa/kernel/entry.S b/arch/xtensa/kernel/entry.S
+index 703cf6205efec..647b162f959b4 100644
+--- a/arch/xtensa/kernel/entry.S
++++ b/arch/xtensa/kernel/entry.S
+@@ -500,8 +500,8 @@ common_exception_return:
+ 	 */
+ 
+ 	_bbsi.l	a4, TIF_NEED_RESCHED, 3f
+-	_bbsi.l	a4, TIF_NOTIFY_RESUME, 2f
+-	_bbci.l	a4, TIF_SIGPENDING, 5f
++	movi	a2, _TIF_SIGPENDING | _TIF_NOTIFY_RESUME | _TIF_NOTIFY_SIGNAL
++	bnone	a4, a2, 5f
+ 
+ 2:	l32i	a4, a1, PT_DEPC
+ 	bgeui	a4, VALID_DOUBLE_EXCEPTION_ADDRESS, 4f
+diff --git a/arch/xtensa/kernel/signal.c b/arch/xtensa/kernel/signal.c
+index 1fb1047f905ca..c4d77dbfb61af 100644
+--- a/arch/xtensa/kernel/signal.c
++++ b/arch/xtensa/kernel/signal.c
+@@ -498,7 +498,8 @@ static void do_signal(struct pt_regs *regs)
+ 
+ void do_notify_resume(struct pt_regs *regs)
+ {
+-	if (test_thread_flag(TIF_SIGPENDING))
++	if (test_thread_flag(TIF_SIGPENDING) ||
++	    test_thread_flag(TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 
+ 	if (test_thread_flag(TIF_NOTIFY_RESUME))
+
+From b969111f5cd9c3fcc5d418e414057527feeab8f1 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 8 Oct 2020 09:11:42 -0600
+Subject: [PATCH 31/43] alpha: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for alpha.
+
+Cc: linux-alpha@vger.kernel.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/alpha/include/asm/thread_info.h | 2 ++
+ arch/alpha/kernel/entry.S            | 2 +-
+ arch/alpha/kernel/signal.c           | 2 +-
+ 3 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/arch/alpha/include/asm/thread_info.h b/arch/alpha/include/asm/thread_info.h
+index 807d7b9a18604..2592356e32154 100644
+--- a/arch/alpha/include/asm/thread_info.h
++++ b/arch/alpha/include/asm/thread_info.h
+@@ -62,6 +62,7 @@ register struct thread_info *__current_thread_info __asm__("$8");
+ #define TIF_SIGPENDING		2	/* signal pending */
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+ #define TIF_SYSCALL_AUDIT	4	/* syscall audit active */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_DIE_IF_KERNEL	9	/* dik recursion lock */
+ #define TIF_MEMDIE		13	/* is terminating due to OOM killer */
+ #define TIF_POLLING_NRFLAG	14	/* idle is polling for TIF_NEED_RESCHED */
+@@ -71,6 +72,7 @@ register struct thread_info *__current_thread_info __asm__("$8");
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
+ #define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
+ #define _TIF_SYSCALL_AUDIT	(1<<TIF_SYSCALL_AUDIT)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
+ 
+ /* Work to do on interrupt/exception return.  */
+diff --git a/arch/alpha/kernel/entry.S b/arch/alpha/kernel/entry.S
+index 2e09248f83242..e227f3a29a43c 100644
+--- a/arch/alpha/kernel/entry.S
++++ b/arch/alpha/kernel/entry.S
+@@ -544,7 +544,7 @@ $ret_success:
+ 	.align	4
+ 	.type	work_pending, @function
+ work_pending:
+-	and	$17, _TIF_NOTIFY_RESUME | _TIF_SIGPENDING, $2
++	and	$17, _TIF_NOTIFY_RESUME | _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL, $2
+ 	bne	$2, $work_notifysig
+ 
+ $work_resched:
+diff --git a/arch/alpha/kernel/signal.c b/arch/alpha/kernel/signal.c
+index 3739efce1ec02..948b89789da82 100644
+--- a/arch/alpha/kernel/signal.c
++++ b/arch/alpha/kernel/signal.c
+@@ -527,7 +527,7 @@ do_work_pending(struct pt_regs *regs, unsigned long thread_flags,
+ 			schedule();
+ 		} else {
+ 			local_irq_enable();
+-			if (thread_flags & _TIF_SIGPENDING) {
++			if (thread_flags & (_TIF_SIGPENDING|_TIF_NOTIFY_SIGNAL)) {
+ 				do_signal(regs, r0, r19);
+ 				r0 = 0;
+ 			} else {
+
+From 0272847406ea6fbe6518113e4e7afb168dbdccd4 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 14:35:34 -0600
+Subject: [PATCH 32/43] c6x: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for c6x.
+
+Cc: linux-c6x-dev@linux-c6x.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/c6x/include/asm/thread_info.h | 1 +
+ arch/c6x/kernel/asm-offsets.c      | 1 +
+ arch/c6x/kernel/signal.c           | 3 ++-
+ 3 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/arch/c6x/include/asm/thread_info.h b/arch/c6x/include/asm/thread_info.h
+index f70382844b965..dd8913d57189d 100644
+--- a/arch/c6x/include/asm/thread_info.h
++++ b/arch/c6x/include/asm/thread_info.h
+@@ -82,6 +82,7 @@ struct thread_info *current_thread_info(void)
+ #define TIF_SIGPENDING		2	/* signal pending */
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+ #define TIF_RESTORE_SIGMASK	4	/* restore signal mask in do_signal() */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ 
+ #define TIF_MEMDIE		17	/* OOM killer killed process */
+ 
+diff --git a/arch/c6x/kernel/asm-offsets.c b/arch/c6x/kernel/asm-offsets.c
+index 0f8fde494875e..4a264ef87dcb8 100644
+--- a/arch/c6x/kernel/asm-offsets.c
++++ b/arch/c6x/kernel/asm-offsets.c
+@@ -116,6 +116,7 @@ void foo(void)
+ 	DEFINE(_TIF_NOTIFY_RESUME, (1<<TIF_NOTIFY_RESUME));
+ 	DEFINE(_TIF_SIGPENDING, (1<<TIF_SIGPENDING));
+ 	DEFINE(_TIF_NEED_RESCHED, (1<<TIF_NEED_RESCHED));
++	DEFINE(_TIF_NOTIFY_SIGNAL, (1<<TIF_NOTIFY_SIGNAL));
+ 
+ 	DEFINE(_TIF_ALLWORK_MASK, TIF_ALLWORK_MASK);
+ 	DEFINE(_TIF_WORK_MASK, TIF_WORK_MASK);
+diff --git a/arch/c6x/kernel/signal.c b/arch/c6x/kernel/signal.c
+index a3f15b9a79dae..862460c3b1830 100644
+--- a/arch/c6x/kernel/signal.c
++++ b/arch/c6x/kernel/signal.c
+@@ -13,6 +13,7 @@
+ #include <linux/syscalls.h>
+ #include <linux/tracehook.h>
+ 
++#include <asm/asm-offsets.h>
+ #include <asm/ucontext.h>
+ #include <asm/cacheflush.h>
+ 
+@@ -313,7 +314,7 @@ asmlinkage void do_notify_resume(struct pt_regs *regs, u32 thread_info_flags,
+ 				 int syscall)
+ {
+ 	/* deal with pending signal delivery */
+-	if (thread_info_flags & (1 << TIF_SIGPENDING))
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs, syscall);
+ 
+ 	if (thread_info_flags & (1 << TIF_NOTIFY_RESUME))
+
+From a40127cdcb91827cdd71b242198946da2a169689 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 14:42:33 -0600
+Subject: [PATCH 33/43] h8300: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for h8300.
+
+Cc: uclinux-h8-devel@lists.sourceforge.jp
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/h8300/include/asm/thread_info.h | 4 +++-
+ arch/h8300/kernel/signal.c           | 2 +-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/arch/h8300/include/asm/thread_info.h b/arch/h8300/include/asm/thread_info.h
+index 0cdaa302d3d28..a518214d4ddd8 100644
+--- a/arch/h8300/include/asm/thread_info.h
++++ b/arch/h8300/include/asm/thread_info.h
+@@ -73,6 +73,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define TIF_SYSCALL_AUDIT	7	/* syscall auditing active */
+ #define TIF_SYSCALL_TRACEPOINT	8	/* for ftrace syscall instrumentation */
+ #define TIF_POLLING_NRFLAG	9	/* true if poll_idle() is polling TIF_NEED_RESCHED */
++#define TIF_NOTIFY_SIGNAL	10	/* signal notifications exist */
+ 
+ /* as above, but as bit values */
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+@@ -83,6 +84,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ 
+ /* work to do in syscall trace */
+ #define _TIF_WORK_SYSCALL_MASK	(_TIF_SYSCALL_TRACE | _TIF_SINGLESTEP | \
+@@ -92,7 +94,7 @@ static inline struct thread_info *current_thread_info(void)
+ #define _TIF_ALLWORK_MASK	(_TIF_SYSCALL_TRACE | _TIF_SIGPENDING      | \
+ 				 _TIF_NEED_RESCHED  | _TIF_SYSCALL_AUDIT   | \
+ 				 _TIF_SINGLESTEP    | _TIF_NOTIFY_RESUME   | \
+-				 _TIF_SYSCALL_TRACEPOINT)
++				 _TIF_SYSCALL_TRACEPOINT | _TIF_NOTIFY_SIGNAL)
+ 
+ /* work to do on interrupt/exception return */
+ #define _TIF_WORK_MASK		(_TIF_ALLWORK_MASK & ~(_TIF_SYSCALL_TRACE | \
+diff --git a/arch/h8300/kernel/signal.c b/arch/h8300/kernel/signal.c
+index 75d9b7e626b2f..75a1c36b105a1 100644
+--- a/arch/h8300/kernel/signal.c
++++ b/arch/h8300/kernel/signal.c
+@@ -279,7 +279,7 @@ static void do_signal(struct pt_regs *regs)
+ 
+ asmlinkage void do_notify_resume(struct pt_regs *regs, u32 thread_info_flags)
+ {
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME)
+
+From ca81c3324e50d3421b86d2fa01f37f963f010009 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 14:49:43 -0600
+Subject: [PATCH 34/43] ia64: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for ia64.
+
+Cc: linux-ia64@vger.kernel.org
+[axboe: added fixes from Mike Rapoport <rppt@kernel.org>]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/ia64/include/asm/thread_info.h | 4 +++-
+ arch/ia64/kernel/process.c          | 3 ++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/ia64/include/asm/thread_info.h b/arch/ia64/include/asm/thread_info.h
+index 64a1011f68121..51d20cb377062 100644
+--- a/arch/ia64/include/asm/thread_info.h
++++ b/arch/ia64/include/asm/thread_info.h
+@@ -103,6 +103,7 @@ struct thread_info {
+ #define TIF_SYSCALL_TRACE	2	/* syscall trace active */
+ #define TIF_SYSCALL_AUDIT	3	/* syscall auditing active */
+ #define TIF_SINGLESTEP		4	/* restore singlestep on return to user mode */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notification exist */
+ #define TIF_NOTIFY_RESUME	6	/* resumption notification requested */
+ #define TIF_MEMDIE		17	/* is terminating due to OOM killer */
+ #define TIF_MCA_INIT		18	/* this task is processing MCA or INIT */
+@@ -115,6 +116,7 @@ struct thread_info {
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+ #define _TIF_SYSCALL_TRACEAUDIT	(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT|_TIF_SINGLESTEP)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+ #define _TIF_MCA_INIT		(1 << TIF_MCA_INIT)
+@@ -124,7 +126,7 @@ struct thread_info {
+ 
+ /* "work to do on user-return" bits */
+ #define TIF_ALLWORK_MASK	(_TIF_SIGPENDING|_TIF_NOTIFY_RESUME|_TIF_SYSCALL_AUDIT|\
+-				 _TIF_NEED_RESCHED|_TIF_SYSCALL_TRACE)
++				 _TIF_NEED_RESCHED|_TIF_SYSCALL_TRACE|_TIF_NOTIFY_SIGNAL)
+ /* like TIF_ALLWORK_BITS but sans TIF_SYSCALL_TRACE or TIF_SYSCALL_AUDIT */
+ #define TIF_WORK_MASK		(TIF_ALLWORK_MASK&~(_TIF_SYSCALL_TRACE|_TIF_SYSCALL_AUDIT))
+ 
+diff --git a/arch/ia64/kernel/process.c b/arch/ia64/kernel/process.c
+index c9ff8796b5097..70649a5b3e888 100644
+--- a/arch/ia64/kernel/process.c
++++ b/arch/ia64/kernel/process.c
+@@ -171,7 +171,8 @@ do_notify_resume_user(sigset_t *unused, struct sigscratch *scr, long in_syscall)
+ 	}
+ 
+ 	/* deal with pending signal delivery */
+-	if (test_thread_flag(TIF_SIGPENDING)) {
++	if (test_thread_flag(TIF_SIGPENDING) ||
++	    test_thread_flag(TIF_NOTIFY_SIGNAL)) {
+ 		local_irq_enable();	/* force interrupt enable */
+ 		ia64_do_signal(scr, in_syscall);
+ 	}
+
+From ff763d7b46c1f956ba3ba7d64953d5dc35f2f777 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:18:43 -0600
+Subject: [PATCH 35/43] nds32: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for nds32.
+
+Cc: Nick Hu <nickhu@andestech.com>
+Cc: Greentime Hu <green.hu@gmail.com>
+Cc: Vincent Chen <deanbo422@gmail.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/nds32/include/asm/thread_info.h | 2 ++
+ arch/nds32/kernel/ex-exit.S          | 2 +-
+ arch/nds32/kernel/signal.c           | 2 +-
+ 3 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/arch/nds32/include/asm/thread_info.h b/arch/nds32/include/asm/thread_info.h
+index c135111ec44eb..d3967ad184f03 100644
+--- a/arch/nds32/include/asm/thread_info.h
++++ b/arch/nds32/include/asm/thread_info.h
+@@ -48,6 +48,7 @@ struct thread_info {
+ #define TIF_NEED_RESCHED	2
+ #define TIF_SINGLESTEP		3
+ #define TIF_NOTIFY_RESUME	4	/* callback before returning to user */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_SYSCALL_TRACE	8
+ #define TIF_POLLING_NRFLAG	17
+ #define TIF_MEMDIE		18
+@@ -57,6 +58,7 @@ struct thread_info {
+ #define _TIF_SIGPENDING		(1 << TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1 << TIF_NEED_RESCHED)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ #define _TIF_SINGLESTEP		(1 << TIF_SINGLESTEP)
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_POLLING_NRFLAG	(1 << TIF_POLLING_NRFLAG)
+diff --git a/arch/nds32/kernel/ex-exit.S b/arch/nds32/kernel/ex-exit.S
+index 6a2966c2d8c8f..b30699911b81e 100644
+--- a/arch/nds32/kernel/ex-exit.S
++++ b/arch/nds32/kernel/ex-exit.S
+@@ -120,7 +120,7 @@ work_pending:
+ 	andi	$p1, $r1, #_TIF_NEED_RESCHED
+ 	bnez	$p1, work_resched
+ 
+-	andi	$p1, $r1, #_TIF_SIGPENDING|#_TIF_NOTIFY_RESUME
++	andi	$p1, $r1, #_TIF_SIGPENDING|#_TIF_NOTIFY_RESUME|#_TIF_NOTIFY_SIGNAL
+ 	beqz	$p1, no_work_pending
+ 
+ 	move	$r0, $sp			! 'regs'
+diff --git a/arch/nds32/kernel/signal.c b/arch/nds32/kernel/signal.c
+index 2acb94812af98..7e3ca430a2233 100644
+--- a/arch/nds32/kernel/signal.c
++++ b/arch/nds32/kernel/signal.c
+@@ -376,7 +376,7 @@ static void do_signal(struct pt_regs *regs)
+ asmlinkage void
+ do_notify_resume(struct pt_regs *regs, unsigned int thread_flags)
+ {
+-	if (thread_flags & _TIF_SIGPENDING)
++	if (thread_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 
+ 	if (thread_flags & _TIF_NOTIFY_RESUME)
+
+From a919079cd89e270bf6d35d71b12c964c7b264b37 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 14:29:17 -0600
+Subject: [PATCH 36/43] riscv: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for riscv.
+
+Cc: linux-riscv@lists.infradead.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/riscv/include/asm/thread_info.h | 5 ++++-
+ arch/riscv/kernel/signal.c           | 2 +-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/arch/riscv/include/asm/thread_info.h b/arch/riscv/include/asm/thread_info.h
+index a390711129de6..97bf5a1575d2c 100644
+--- a/arch/riscv/include/asm/thread_info.h
++++ b/arch/riscv/include/asm/thread_info.h
+@@ -74,6 +74,7 @@ struct thread_info {
+ #define TIF_SYSCALL_TRACEPOINT  6       /* syscall tracepoint instrumentation */
+ #define TIF_SYSCALL_AUDIT	7	/* syscall auditing */
+ #define TIF_SECCOMP		8	/* syscall secure computing */
++#define TIF_NOTIFY_SIGNAL	9	/* signal notifications exist */
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+@@ -82,9 +83,11 @@ struct thread_info {
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_SYSCALL_AUDIT	(1 << TIF_SYSCALL_AUDIT)
+ #define _TIF_SECCOMP		(1 << TIF_SECCOMP)
++#define _TIF_NOTIFY_SIGNAL	(1 << TIF_NOTIFY_SIGNAL)
+ 
+ #define _TIF_WORK_MASK \
+-	(_TIF_NOTIFY_RESUME | _TIF_SIGPENDING | _TIF_NEED_RESCHED)
++	(_TIF_NOTIFY_RESUME | _TIF_SIGPENDING | _TIF_NEED_RESCHED | \
++	 _TIF_NOTIFY_SIGNAL)
+ 
+ #define _TIF_SYSCALL_WORK \
+ 	(_TIF_SYSCALL_TRACE | _TIF_SYSCALL_TRACEPOINT | _TIF_SYSCALL_AUDIT | \
+diff --git a/arch/riscv/kernel/signal.c b/arch/riscv/kernel/signal.c
+index bc6841867b512..469aef8ed922e 100644
+--- a/arch/riscv/kernel/signal.c
++++ b/arch/riscv/kernel/signal.c
+@@ -310,7 +310,7 @@ asmlinkage __visible void do_notify_resume(struct pt_regs *regs,
+ 					   unsigned long thread_info_flags)
+ {
+ 	/* Handle pending signal delivery */
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs);
+ 
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME)
+
+From 322dcde67182c84ee981e029a621dfcf7ca1b988 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 15:44:37 -0600
+Subject: [PATCH 37/43] sparc: add support for TIF_NOTIFY_SIGNAL
+
+Wire up TIF_NOTIFY_SIGNAL handling for sparc.
+
+Cc: sparclinux@vger.kernel.org
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ arch/sparc/include/asm/thread_info_32.h | 4 +++-
+ arch/sparc/include/asm/thread_info_64.h | 6 ++++--
+ arch/sparc/kernel/signal_32.c           | 2 +-
+ arch/sparc/kernel/signal_64.c           | 2 +-
+ 4 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/arch/sparc/include/asm/thread_info_32.h b/arch/sparc/include/asm/thread_info_32.h
+index 548b366165dd1..45b4955b253f2 100644
+--- a/arch/sparc/include/asm/thread_info_32.h
++++ b/arch/sparc/include/asm/thread_info_32.h
+@@ -104,6 +104,7 @@ register struct thread_info *current_thread_info_reg asm("g6");
+ #define TIF_SIGPENDING		2	/* signal pending */
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+ #define TIF_RESTORE_SIGMASK	4	/* restore signal mask in do_signal() */
++#define TIF_NOTIFY_SIGNAL	5	/* signal notifications exist */
+ #define TIF_USEDFPU		8	/* FPU was used by this task
+ 					 * this quantum (SMP) */
+ #define TIF_POLLING_NRFLAG	9	/* true if poll_idle() is polling
+@@ -115,11 +116,12 @@ register struct thread_info *current_thread_info_reg asm("g6");
+ #define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_USEDFPU		(1<<TIF_USEDFPU)
+ #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
+ 
+ #define _TIF_DO_NOTIFY_RESUME_MASK	(_TIF_NOTIFY_RESUME | \
+-					 _TIF_SIGPENDING)
++					 _TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL)
+ 
+ #define is_32bit_task()	(1)
+ 
+diff --git a/arch/sparc/include/asm/thread_info_64.h b/arch/sparc/include/asm/thread_info_64.h
+index 20255471e653d..42cd4cd3892e3 100644
+--- a/arch/sparc/include/asm/thread_info_64.h
++++ b/arch/sparc/include/asm/thread_info_64.h
+@@ -180,7 +180,7 @@ extern struct thread_info *current_thread_info(void);
+ #define TIF_NOTIFY_RESUME	1	/* callback before returning to user */
+ #define TIF_SIGPENDING		2	/* signal pending */
+ #define TIF_NEED_RESCHED	3	/* rescheduling necessary */
+-/* flag bit 4 is available */
++#define TIF_NOTIFY_SIGNAL	4	/* signal notifications exist */
+ #define TIF_UNALIGNED		5	/* allowed to do unaligned accesses */
+ #define TIF_UPROBE		6	/* breakpointed or singlestepped */
+ #define TIF_32BIT		7	/* 32-bit binary */
+@@ -200,6 +200,7 @@ extern struct thread_info *current_thread_info(void);
+ #define _TIF_NOTIFY_RESUME	(1<<TIF_NOTIFY_RESUME)
+ #define _TIF_SIGPENDING		(1<<TIF_SIGPENDING)
+ #define _TIF_NEED_RESCHED	(1<<TIF_NEED_RESCHED)
++#define _TIF_NOTIFY_SIGNAL	(1<<TIF_NOTIFY_SIGNAL)
+ #define _TIF_UNALIGNED		(1<<TIF_UNALIGNED)
+ #define _TIF_UPROBE		(1<<TIF_UPROBE)
+ #define _TIF_32BIT		(1<<TIF_32BIT)
+@@ -213,7 +214,8 @@ extern struct thread_info *current_thread_info(void);
+ 				 _TIF_DO_NOTIFY_RESUME_MASK | \
+ 				 _TIF_NEED_RESCHED)
+ #define _TIF_DO_NOTIFY_RESUME_MASK	(_TIF_NOTIFY_RESUME | \
+-					 _TIF_SIGPENDING | _TIF_UPROBE)
++					 _TIF_SIGPENDING | _TIF_UPROBE | \
++					 _TIF_NOTIFY_SIGNAL)
+ 
+ #define is_32bit_task()	(test_thread_flag(TIF_32BIT))
+ 
+diff --git a/arch/sparc/kernel/signal_32.c b/arch/sparc/kernel/signal_32.c
+index 741d0701003af..11cf2281b5817 100644
+--- a/arch/sparc/kernel/signal_32.c
++++ b/arch/sparc/kernel/signal_32.c
+@@ -521,7 +521,7 @@ static void do_signal(struct pt_regs *regs, unsigned long orig_i0)
+ void do_notify_resume(struct pt_regs *regs, unsigned long orig_i0,
+ 		      unsigned long thread_info_flags)
+ {
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs, orig_i0);
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME)
+ 		tracehook_notify_resume(regs);
+diff --git a/arch/sparc/kernel/signal_64.c b/arch/sparc/kernel/signal_64.c
+index f7ef7edcd5c1a..a0eec62c825df 100644
+--- a/arch/sparc/kernel/signal_64.c
++++ b/arch/sparc/kernel/signal_64.c
+@@ -549,7 +549,7 @@ void do_notify_resume(struct pt_regs *regs, unsigned long orig_i0, unsigned long
+ 	user_exit();
+ 	if (thread_info_flags & _TIF_UPROBE)
+ 		uprobe_notify_resume(regs);
+-	if (thread_info_flags & _TIF_SIGPENDING)
++	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_NOTIFY_SIGNAL))
+ 		do_signal(regs, orig_i0);
+ 	if (thread_info_flags & _TIF_NOTIFY_RESUME)
+ 		tracehook_notify_resume(regs);
+
+From 0d02d3f2871c51158057da068d86d8268c6c789f Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 16:01:33 -0600
+Subject: [PATCH 38/43] task_work: remove legacy TWA_SIGNAL path
+
+All archs now support TIF_NOTIFY_SIGNAL.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ kernel/task_work.c | 30 +-----------------------------
+ 1 file changed, 1 insertion(+), 29 deletions(-)
+
+diff --git a/kernel/task_work.c b/kernel/task_work.c
+index 15b087286bea4..9cde961875c0a 100644
+--- a/kernel/task_work.c
++++ b/kernel/task_work.c
+@@ -5,34 +5,6 @@
+ 
+ static struct callback_head work_exited; /* all we need is ->next == NULL */
+ 
+-/*
+- * TWA_SIGNAL signaling - use TIF_NOTIFY_SIGNAL, if available, as it's faster
+- * than TIF_SIGPENDING as there's no dependency on ->sighand. The latter is
+- * shared for threads, and can cause contention on sighand->lock. Even for
+- * the non-threaded case TIF_NOTIFY_SIGNAL is more efficient, as no locking
+- * or IRQ disabling is involved for notification (or running) purposes.
+- */
+-static void task_work_notify_signal(struct task_struct *task)
+-{
+-#if defined(TIF_NOTIFY_SIGNAL)
+-	set_notify_signal(task);
+-#else
+-	unsigned long flags;
+-
+-	/*
+-	 * Only grab the sighand lock if we don't already have some
+-	 * task_work pending. This pairs with the smp_store_mb()
+-	 * in get_signal(), see comment there.
+-	 */
+-	if (!(READ_ONCE(task->jobctl) & JOBCTL_TASK_WORK) &&
+-	    lock_task_sighand(task, &flags)) {
+-		task->jobctl |= JOBCTL_TASK_WORK;
+-		signal_wake_up(task, 0);
+-		unlock_task_sighand(task, &flags);
+-	}
+-#endif
+-}
+-
+ /**
+  * task_work_add - ask the @task to execute @work->func()
+  * @task: the task which should run the callback
+@@ -76,7 +48,7 @@ int task_work_add(struct task_struct *task, struct callback_head *work,
+ 		set_notify_resume(task);
+ 		break;
+ 	case TWA_SIGNAL:
+-		task_work_notify_signal(task);
++		set_notify_signal(task);
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+
+From a34dc39260df9052e3bb14ab10c27b8d8c9a1978 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 22 Oct 2020 20:17:18 -0600
+Subject: [PATCH 39/43] io_uring: JOBCTL_TASK_WORK is no longer used by
+ task_work
+
+Remove the dead code, TWA_SIGNAL will never set JOBCTL_TASK_WORK at
+this point.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/io_uring.c | 9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 86dac2b2e2763..537c4586d9f6f 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -6862,13 +6862,8 @@ static int io_run_task_work_sig(void)
+ 		return 1;
+ 	if (!signal_pending(current))
+ 		return 0;
+-	if (current->jobctl & JOBCTL_TASK_WORK) {
+-		spin_lock_irq(&current->sighand->siglock);
+-		current->jobctl &= ~JOBCTL_TASK_WORK;
+-		recalc_sigpending();
+-		spin_unlock_irq(&current->sighand->siglock);
+-		return 1;
+-	}
++	if (test_tsk_thread_flag(current, TIF_NOTIFY_SIGNAL))
++		return -ERESTARTSYS;
+ 	return -EINTR;
+ }
+ 
+
+From fb16873b08ffa14d6af99e97d97bdcb5a4a5f608 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 16:03:01 -0600
+Subject: [PATCH 40/43] signal: kill JOBCTL_TASK_WORK
+
+It's no longer used, get rid of it.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ include/linux/sched/jobctl.h |  4 +---
+ kernel/signal.c              | 20 --------------------
+ 2 files changed, 1 insertion(+), 23 deletions(-)
+
+diff --git a/include/linux/sched/jobctl.h b/include/linux/sched/jobctl.h
+index d2b4204ba4d34..fa067de9f1a94 100644
+--- a/include/linux/sched/jobctl.h
++++ b/include/linux/sched/jobctl.h
+@@ -19,7 +19,6 @@ struct task_struct;
+ #define JOBCTL_TRAPPING_BIT	21	/* switching to TRACED */
+ #define JOBCTL_LISTENING_BIT	22	/* ptracer is listening for events */
+ #define JOBCTL_TRAP_FREEZE_BIT	23	/* trap for cgroup freezer */
+-#define JOBCTL_TASK_WORK_BIT	24	/* set by TWA_SIGNAL */
+ 
+ #define JOBCTL_STOP_DEQUEUED	(1UL << JOBCTL_STOP_DEQUEUED_BIT)
+ #define JOBCTL_STOP_PENDING	(1UL << JOBCTL_STOP_PENDING_BIT)
+@@ -29,10 +28,9 @@ struct task_struct;
+ #define JOBCTL_TRAPPING		(1UL << JOBCTL_TRAPPING_BIT)
+ #define JOBCTL_LISTENING	(1UL << JOBCTL_LISTENING_BIT)
+ #define JOBCTL_TRAP_FREEZE	(1UL << JOBCTL_TRAP_FREEZE_BIT)
+-#define JOBCTL_TASK_WORK	(1UL << JOBCTL_TASK_WORK_BIT)
+ 
+ #define JOBCTL_TRAP_MASK	(JOBCTL_TRAP_STOP | JOBCTL_TRAP_NOTIFY)
+-#define JOBCTL_PENDING_MASK	(JOBCTL_STOP_PENDING | JOBCTL_TRAP_MASK | JOBCTL_TASK_WORK)
++#define JOBCTL_PENDING_MASK	(JOBCTL_STOP_PENDING | JOBCTL_TRAP_MASK)
+ 
+ extern bool task_set_jobctl_pending(struct task_struct *task, unsigned long mask);
+ extern void task_clear_jobctl_trapping(struct task_struct *task);
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 923230ff6cfca..cf8b057ca2acf 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2556,26 +2556,6 @@ bool get_signal(struct ksignal *ksig)
+ 
+ relock:
+ 	spin_lock_irq(&sighand->siglock);
+-	/*
+-	 * Make sure we can safely read ->jobctl() in task_work add. As Oleg
+-	 * states:
+-	 *
+-	 * It pairs with mb (implied by cmpxchg) before READ_ONCE. So we
+-	 * roughly have
+-	 *
+-	 *	task_work_add:				get_signal:
+-	 *	STORE(task->task_works, new_work);	STORE(task->jobctl);
+-	 *	mb();					mb();
+-	 *	LOAD(task->jobctl);			LOAD(task->task_works);
+-	 *
+-	 * and we can rely on STORE-MB-LOAD [ in task_work_add].
+-	 */
+-	smp_store_mb(current->jobctl, current->jobctl & ~JOBCTL_TASK_WORK);
+-	if (unlikely(current->task_works)) {
+-		spin_unlock_irq(&sighand->siglock);
+-		task_work_run();
+-		goto relock;
+-	}
+ 
+ 	/*
+ 	 * Every stopped thread goes here after wakeup. Check to see if
+
+From 56955d3be50e428f4033d40053e9e02b2c781f9b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 9 Oct 2020 16:04:39 -0600
+Subject: [PATCH 41/43] kernel: remove checking for TIF_NOTIFY_SIGNAL
+
+It's available everywhere now, no need to check or add dummy defines.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ include/linux/entry-common.h | 4 ----
+ include/linux/sched/signal.h | 2 --
+ include/linux/tracehook.h    | 4 ----
+ kernel/signal.c              | 2 --
+ 4 files changed, 12 deletions(-)
+
+diff --git a/include/linux/entry-common.h b/include/linux/entry-common.h
+index b9711e813ec2d..abec3a5ae7997 100644
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@ -37,10 +37,6 @@
+ # define _TIF_UPROBE			(0)
+ #endif
+ 
+-#ifndef _TIF_NOTIFY_SIGNAL
+-# define _TIF_NOTIFY_SIGNAL		(0)
+-#endif
+-
+ /*
+  * TIF flags handled in syscall_enter_from_user_mode()
+  */
+diff --git a/include/linux/sched/signal.h b/include/linux/sched/signal.h
+index bd5afa0761897..24b7b862e043d 100644
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@ -360,7 +360,6 @@ static inline int task_sigpending(struct task_struct *p)
+ 
+ static inline int signal_pending(struct task_struct *p)
+ {
+-#if defined(TIF_NOTIFY_SIGNAL)
+ 	/*
+ 	 * TIF_NOTIFY_SIGNAL isn't really a signal, but it requires the same
+ 	 * behavior in terms of ensuring that we break out of wait loops
+@@ -368,7 +367,6 @@ static inline int signal_pending(struct task_struct *p)
+ 	 */
+ 	if (unlikely(test_tsk_thread_flag(p, TIF_NOTIFY_SIGNAL)))
+ 		return 1;
+-#endif
+ 	return task_sigpending(p);
+ }
+ 
+diff --git a/include/linux/tracehook.h b/include/linux/tracehook.h
+index f7d82e4fafd6c..ee9ab7dbc8c35 100644
+--- a/include/linux/tracehook.h
++++ b/include/linux/tracehook.h
+@@ -205,12 +205,10 @@ static inline void tracehook_notify_resume(struct pt_regs *regs)
+  */
+ static inline void tracehook_notify_signal(void)
+ {
+-#if defined(TIF_NOTIFY_SIGNAL)
+ 	clear_thread_flag(TIF_NOTIFY_SIGNAL);
+ 	smp_mb__after_atomic();
+ 	if (current->task_works)
+ 		task_work_run();
+-#endif
+ }
+ 
+ /*
+@@ -218,11 +216,9 @@ static inline void tracehook_notify_signal(void)
+  */
+ static inline void set_notify_signal(struct task_struct *task)
+ {
+-#if defined(TIF_NOTIFY_SIGNAL)
+ 	if (!test_and_set_tsk_thread_flag(task, TIF_NOTIFY_SIGNAL) &&
+ 	    !wake_up_state(task, TASK_INTERRUPTIBLE))
+ 		kick_process(task);
+-#endif
+ }
+ 
+ #endif	/* <linux/tracehook.h> */
+diff --git a/kernel/signal.c b/kernel/signal.c
+index cf8b057ca2acf..ccd530509201a 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2535,14 +2535,12 @@ bool get_signal(struct ksignal *ksig)
+ 	 * that the arch handlers don't all have to do it. If we get here
+ 	 * without TIF_SIGPENDING, just exit after running signal work.
+ 	 */
+-#ifdef TIF_NOTIFY_SIGNAL
+ 	if (!IS_ENABLED(CONFIG_GENERIC_ENTRY)) {
+ 		if (test_thread_flag(TIF_NOTIFY_SIGNAL))
+ 			tracehook_notify_signal();
+ 		if (!task_sigpending(current))
+ 			return false;
+ 	}
+-#endif
+ 
+ 	if (unlikely(uprobe_deny_signal()))
+ 		return false;
+
+From 57c65f245f50d58aa38f9effba1e0dbfa9ccb108 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 22 Oct 2020 20:19:35 -0600
+Subject: [PATCH 42/43] io_uring: remove 'twa_signal_ok' deadlock work-around
+
+The TIF_NOTIFY_SIGNAL based implementation of TWA_SIGNAL is always safe
+to use, regardless of context, as we won't be recursing into the signal
+lock. So now that all archs are using that, we can drop this deadlock
+work-around as it's always safe to use TWA_SIGNAL.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/io_uring.c | 21 ++++++---------------
+ 1 file changed, 6 insertions(+), 15 deletions(-)
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 537c4586d9f6f..766d4645c560a 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -1996,7 +1996,7 @@ static struct io_kiocb *io_req_find_next(struct io_kiocb *req)
+ 	return __io_req_find_next(req);
+ }
+ 
+-static int io_req_task_work_add(struct io_kiocb *req, bool twa_signal_ok)
++static int io_req_task_work_add(struct io_kiocb *req)
+ {
+ 	struct task_struct *tsk = req->task;
+ 	struct io_ring_ctx *ctx = req->ctx;
+@@ -2013,7 +2013,7 @@ static int io_req_task_work_add(struct io_kiocb *req, bool twa_signal_ok)
+ 	 * will do the job.
+ 	 */
+ 	notify = TWA_NONE;
+-	if (!(ctx->flags & IORING_SETUP_SQPOLL) && twa_signal_ok)
++	if (!(ctx->flags & IORING_SETUP_SQPOLL))
+ 		notify = TWA_SIGNAL;
+ 
+ 	ret = task_work_add(tsk, &req->task_work, notify);
+@@ -2075,7 +2075,7 @@ static void io_req_task_queue(struct io_kiocb *req)
+ 	init_task_work(&req->task_work, io_req_task_submit);
+ 	percpu_ref_get(&req->ctx->refs);
+ 
+-	ret = io_req_task_work_add(req, true);
++	ret = io_req_task_work_add(req);
+ 	if (unlikely(ret)) {
+ 		struct task_struct *tsk;
+ 
+@@ -2197,7 +2197,7 @@ static void io_free_req_deferred(struct io_kiocb *req)
+ 	int ret;
+ 
+ 	init_task_work(&req->task_work, io_put_req_deferred_cb);
+-	ret = io_req_task_work_add(req, true);
++	ret = io_req_task_work_add(req);
+ 	if (unlikely(ret)) {
+ 		struct task_struct *tsk;
+ 
+@@ -3305,7 +3305,7 @@ static int io_async_buf_func(struct wait_queue_entry *wait, unsigned mode,
+ 
+ 	/* submit ref gets dropped, acquire a new one */
+ 	refcount_inc(&req->refs);
+-	ret = io_req_task_work_add(req, true);
++	ret = io_req_task_work_add(req);
+ 	if (unlikely(ret)) {
+ 		struct task_struct *tsk;
+ 
+@@ -4859,7 +4859,6 @@ struct io_poll_table {
+ static int __io_async_wake(struct io_kiocb *req, struct io_poll_iocb *poll,
+ 			   __poll_t mask, task_work_func_t func)
+ {
+-	bool twa_signal_ok;
+ 	int ret;
+ 
+ 	/* for instances that support it check for an event match first: */
+@@ -4874,21 +4873,13 @@ static int __io_async_wake(struct io_kiocb *req, struct io_poll_iocb *poll,
+ 	init_task_work(&req->task_work, func);
+ 	percpu_ref_get(&req->ctx->refs);
+ 
+-	/*
+-	 * If we using the signalfd wait_queue_head for this wakeup, then
+-	 * it's not safe to use TWA_SIGNAL as we could be recursing on the
+-	 * tsk->sighand->siglock on doing the wakeup. Should not be needed
+-	 * either, as the normal wakeup will suffice.
+-	 */
+-	twa_signal_ok = (poll->head != &req->task->sighand->signalfd_wqh);
+-
+ 	/*
+ 	 * If this fails, then the task is exiting. When a task exits, the
+ 	 * work gets canceled, so just cancel this request as well instead
+ 	 * of executing it. We can't safely execute it anyway, as we may not
+ 	 * have the needed state needed for it anyway.
+ 	 */
+-	ret = io_req_task_work_add(req, twa_signal_ok);
++	ret = io_req_task_work_add(req);
+ 	if (unlikely(ret)) {
+ 		struct task_struct *tsk;
+ 
+
+From a46a5858368f320e63e91c18b935a8d72b0fe067 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Tue, 5 Jan 2021 11:32:43 -0700
+Subject: [PATCH 43/43] fs: process fput task_work with TWA_SIGNAL
+
+Song reported a boot regression in a kvm image with 5.11-rc, and bisected
+it down to the below patch. Debugging this issue, turns out that the boot
+stalled when a task is waiting on a pipe being released. As we no longer
+run task_work from get_signal() unless it's queued with TWA_SIGNAL, the
+task goes idle without running the task_work. This prevents ->release()
+from being called on the pipe, which another boot task is waiting on.
+
+Use TWA_SIGNAL for the file fput work to ensure it's run before the task
+goes idle.
+
+Fixes: 98b89b649fce ("signal: kill JOBCTL_TASK_WORK")
+Reported-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+---
+ fs/file_table.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 709ada3151da5..da09fb546134c 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -339,7 +339,13 @@ void fput_many(struct file *file, unsigned int refs)
+ 
+ 		if (likely(!in_interrupt() && !(task->flags & PF_KTHREAD))) {
+ 			init_task_work(&file->f_u.fu_rcuhead, ____fput);
+-			if (!task_work_add(task, &file->f_u.fu_rcuhead, TWA_RESUME))
++			/*
++			 * We could be dependent on the fput task_work running,
++			 * eg for pipes where someone is waiting on release
++			 * being called. Use TWA_SIGNAL to ensure it's run
++			 * before the task goes idle.
++			 */
++			if (!task_work_add(task, &file->f_u.fu_rcuhead, TWA_SIGNAL))
+ 				return;
+ 			/*
+ 			 * After this task has run exit_task_work(),
