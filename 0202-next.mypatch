@@ -1557,34 +1557,10 @@ index 55bcee5dc0320..421a40968c9ff 100644
  	/* same CPU or cache domain?  Complete locally */
  	if (cpu == rq->mq_ctx->cpu ||
 
-From ae194fd3dae2a427b6788811b8ab1c7e1065a793 Mon Sep 17 00:00:00 2001
-From: intersectRaven <rjgolo@gmail.com>
-Date: Sun, 27 Dec 2020 18:10:51 +0800
-Subject: [PATCH 14/17] Revert "PCI/PM Runtime: Make runtime PM of PCI devices
- inactive by default"
-
-This reverts commit bb910a7040e90a0ca3d3e8245d6d5c128a5d1287.
----
- drivers/pci/pci.c | 1 -
- 1 file changed, 1 deletion(-)
-
-diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
-index e578d34095e91..b4c06d4766bfd 100644
---- a/drivers/pci/pci.c
-+++ b/drivers/pci/pci.c
-@@ -3003,7 +3003,6 @@ void pci_pm_init(struct pci_dev *dev)
- 	u16 status;
- 	u16 pmc;
- 
--	pm_runtime_forbid(&dev->dev);
- 	pm_runtime_set_active(&dev->dev);
- 	pm_runtime_enable(&dev->dev);
- 	device_enable_async_suspend(&dev->dev);
-
-From e866fcdeb9bcd54172de67f2e0efd9fbe4b4a819 Mon Sep 17 00:00:00 2001
+From 383255e1c09a8a29262b96f8834aefec365af9ee Mon Sep 17 00:00:00 2001
 From: Yuqi Jin <jinyuqi@huawei.com>
 Date: Tue, 5 Jan 2021 12:10:18 +1100
-Subject: [PATCH 15/17] lib-optimize-cpumask_local_spread-v8
+Subject: [PATCH 14/17] lib-optimize-cpumask_local_spread-v8
 
     1. Fix confusing comments
     2. Improve the loop for choosing the nearest node.

@@ -58,10 +58,10 @@ index 9bc59fd2f95f..64ad6f8d1664 100644
 +		drm_err(&i915->drm, "Failed to write source OUI\n");
 +}
 +
- /* If the sink supports it, try to set the power state appropriately */
- void intel_dp_sink_dpms(struct intel_dp *intel_dp, int mode)
+ /* If the device supports it, try to set the power state appropriately */
+ void intel_dp_set_power(struct intel_dp *intel_dp, u8 mode)
  {
-@@ -3511,6 +3534,12 @@ void intel_dp_sink_dpms(struct intel_dp *intel_dp, int mode)
+@@ -3511,6 +3534,12 @@ void intel_dp_set_power(struct intel_dp *intel_dp, u8 mode)
  	} else {
  		struct intel_lspcon *lspcon = dp_to_lspcon(intel_dp);
  
