@@ -1217,7 +1217,7 @@ index ae7ceba8fd4f..93727d2bf702 100644
  
  dequeue_throttle:
 +#endif
- 	util_est_dequeue(&rq->cfs, p, task_sleep);
+ 	util_est_update(&rq->cfs, p, task_sleep);
  	hrtick_update(rq);
  }
 @@ -5725,6 +6073,7 @@ static unsigned long capacity_of(int cpu)
